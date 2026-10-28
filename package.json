@@ -1,0 +1,15 @@
+{
+  "name": "timora-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TIMORA — Constraint-Satisfaction Recruitment Scheduler (Webster 2026 Team Sh Trio)",
+  "scripts": {
+    "install:all": "npm install && cd backend && npm install && cd ../frontend && npm install",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "seed": "npm --prefix backend run seed",
+    "test": "npm --prefix backend run test",
+    "build": "npm --prefix backend run build && npm --prefix frontend run build"
+  }
+}
+

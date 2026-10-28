@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: #fafafa;
+  color: #0a0a0a;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Monochrome FullCalendar Overrides */
+.fc {
+  --fc-border-color: #e5e5e5;
+  --fc-button-bg-color: #0a0a0a;
+  --fc-button-border-color: #0a0a0a;
+  --fc-button-hover-bg-color: #262626;
+  --fc-button-hover-border-color: #262626;
+  --fc-button-active-bg-color: #404040;
+  --fc-event-bg-color: #0a0a0a;
+  --fc-event-border-color: #0a0a0a;
+  --fc-event-text-color: #ffffff;
+  --fc-today-bg-color: #f5f5f5;
+  font-size: 12.5px;
+}
+
