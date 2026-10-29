@@ -3,7 +3,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { ApplicationShell } from '@/components/ApplicationShell';
-import { apiFetch, API_BASE, getStoredToken } from '@/lib/api';
+import { apiFetch, downloadCandidateCV, downloadScheduleICS } from '@/lib/api';
 
 export default function CandidatePortalPage() {
   const router = useRouter();
@@ -17,6 +17,7 @@ export default function CandidatePortalPage() {
   // Self-Booking State
   const [selectedDriveId, setSelectedDriveId] = useState('');
   const [recommendedSlots, setRecommendedSlots] = useState<any[]>([]);
+  const [alreadyBookedSessions, setAlreadyBookedSessions] = useState<any[]>([]);
   const [loadingSlots, setLoadingSlots] = useState(false);
   const [bookingInProgress, setBookingInProgress] = useState(false);
 
@@ -33,7 +34,7 @@ export default function CandidatePortalPage() {
   const [profileCgpa, setProfileCgpa] = useState(9.34);
   const [profileSkills, setProfileSkills] = useState('');
 
-  // CV Upload State (Mandated inside Profile per Sketch 2.jpeg)
+  // CV Upload State
   const [cvFile, setCvFile] = useState<File | null>(null);
   const [uploadingCv, setUploadingCv] = useState(false);
 
@@ -81,6 +82,7 @@ export default function CandidatePortalPage() {
       setLoadingSlots(true);
       const res = await apiFetch(`/candidate/self-booking/options/${driveId}`);
       setRecommendedSlots(res.recommendedSlots || []);
+      setAlreadyBookedSessions(res.alreadyBookedSessions || []);
     } catch (err) {
       setErrorMessage((err as Error).message);
     } finally {
@@ -130,15 +132,50 @@ export default function CandidatePortalPage() {
       const startMs = new Date(`${availDate}T${availStartTime}:00.000Z`).getTime();
       const endMs = new Date(`${availDate}T${availEndTime}:00.000Z`).getTime();
 
+      const existing = (dashboardData.availability || []).map((w: any) => ({
+        startMs: w.startMs,
+        endMs: w.endMs,
+      }));
+      const merged = [
+        ...existing.filter((w: any) => !(w.startMs === startMs && w.endMs === endMs)),
+        { startMs, endMs },
+      ];
+
       await apiFetch('/availability', {
         method: 'PUT',
         body: JSON.stringify({
-          windows: [{ startMs, endMs }],
+          windows: merged,
         }),
       });
 
-      setActionMessage('Your availability window has been updated.');
+      setActionMessage('Your availability window has been added.');
       await loadData();
+      if (selectedDriveId) {
+        await loadBookingSlots(selectedDriveId);
+      }
+    } catch (err) {
+      setErrorMessage((err as Error).message);
+    }
+  };
+
+  const handleRemoveAvailabilityWindow = async (idxToRemove: number) => {
+    try {
+      const remaining = (dashboardData.availability || [])
+        .filter((_: any, idx: number) => idx !== idxToRemove)
+        .map((w: any) => ({ startMs: w.startMs, endMs: w.endMs }));
+
+      await apiFetch('/availability', {
+        method: 'PUT',
+        body: JSON.stringify({
+          windows: remaining,
+        }),
+      });
+
+      setActionMessage('Availability window removed.');
+      await loadData();
+      if (selectedDriveId) {
+        await loadBookingSlots(selectedDriveId);
+      }
     } catch (err) {
       setErrorMessage((err as Error).message);
     }
@@ -209,6 +246,7 @@ export default function CandidatePortalPage() {
   );
 
   const nextInterview = scheduledSessions[0] || null;
+  const candidateUserId = user.userId || user._id;
 
   return (
     <ApplicationShell
@@ -237,7 +275,6 @@ export default function CandidatePortalPage() {
       )}
 
       {/* ==================== TAB 1: DASHBOARD ==================== */}
-      {/* Matches Sketch 2.jpeg: Technical Rounds, Completed, Upcoming Interviews, No Apply for Company */}
       {activeTab === 'Dashboard' && (
         <div className="space-y-6">
           <div>
@@ -252,7 +289,7 @@ export default function CandidatePortalPage() {
             </p>
           </div>
 
-          {/* NEXT INTERVIEW DARK BANNER (as in Sketch 2 & HTML Prototype) */}
+          {/* NEXT INTERVIEW DARK BANNER */}
           {nextInterview ? (
             <div className="bg-neutral-950 text-white rounded-lg p-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
               <div>
@@ -347,7 +384,10 @@ export default function CandidatePortalPage() {
               <h3 className="font-bold text-sm text-neutral-950">Active Placement Drives</h3>
               <div className="space-y-3">
                 {dashboardData.drives.map((d: any) => (
-                  <div key={d._id} className="p-3.5 rounded border border-neutral-200 bg-neutral-50 space-y-1">
+                  <div
+                    key={d._id}
+                    className="p-3.5 rounded border border-neutral-200 bg-neutral-50 space-y-1"
+                  >
                     <div className="flex items-center justify-between">
                       <span className="text-[11px] font-mono uppercase text-neutral-500">
                         {d.companyName}
@@ -371,11 +411,22 @@ export default function CandidatePortalPage() {
       {/* ==================== TAB 2: MY INTERVIEWS ==================== */}
       {activeTab === 'My Interviews' && (
         <div className="space-y-6">
-          <div>
-            <h1 className="text-xl font-bold text-neutral-950">My Interviews</h1>
-            <p className="text-xs text-neutral-500">
-              Verified timetable of your scheduled and completed recruitment evaluation rounds
-            </p>
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h1 className="text-xl font-bold text-neutral-950">My Interviews</h1>
+              <p className="text-xs text-neutral-500">
+                Verified timetable of your scheduled and completed recruitment evaluation rounds
+              </p>
+            </div>
+            {dashboardData.sessions.length > 0 && (
+              <button
+                type="button"
+                onClick={() => downloadScheduleICS().catch((e) => setErrorMessage(e.message))}
+                className="px-3.5 py-2 rounded bg-neutral-950 text-white text-xs font-semibold hover:bg-neutral-800 transition"
+              >
+                Export .ICS Calendar
+              </button>
+            )}
           </div>
 
           <div className="bg-white border border-neutral-200 rounded-lg overflow-hidden">
@@ -485,7 +536,7 @@ export default function CandidatePortalPage() {
                   type="submit"
                   className="w-full h-9 rounded bg-neutral-950 text-white text-xs font-semibold hover:bg-neutral-800 transition"
                 >
-                  Save Free Windows
+                  + Add Free Window
                 </button>
               </form>
 
@@ -498,10 +549,19 @@ export default function CandidatePortalPage() {
                 ) : (
                   <ul className="text-xs font-mono divide-y divide-neutral-100">
                     {dashboardData.availability.map((w: any, idx: number) => (
-                      <li key={idx} className="py-1">
-                        {new Date(w.startMs).toISOString().slice(11, 16)}–
-                        {new Date(w.endMs).toISOString().slice(11, 16)} UTC (
-                        {new Date(w.startMs).toISOString().slice(0, 10)})
+                      <li key={idx} className="py-1.5 flex items-center justify-between">
+                        <span>
+                          {new Date(w.startMs).toISOString().slice(11, 16)}–
+                          {new Date(w.endMs).toISOString().slice(11, 16)} UTC (
+                          {new Date(w.startMs).toISOString().slice(0, 10)})
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveAvailabilityWindow(idx)}
+                          className="text-red-600 hover:text-red-800 text-[11px] font-sans font-medium"
+                        >
+                          Remove
+                        </button>
                       </li>
                     ))}
                   </ul>
@@ -533,6 +593,20 @@ export default function CandidatePortalPage() {
                 </div>
               </div>
 
+              {alreadyBookedSessions.length > 0 && (
+                <div className="p-3 rounded border border-neutral-200 bg-neutral-50 text-xs space-y-1">
+                  <p className="font-bold text-neutral-950">
+                    Confirmed Reservations in This Drive:
+                  </p>
+                  {alreadyBookedSessions.map((s: any) => (
+                    <p key={s._id} className="font-mono text-neutral-700">
+                      • {s.roundName}: {new Date(s.startMs).toISOString().slice(11, 16)}–
+                      {new Date(s.endMs).toISOString().slice(11, 16)} UTC in {s.roomName} ({s.status})
+                    </p>
+                  ))}
+                </div>
+              )}
+
               {loadingSlots ? (
                 <p className="text-xs text-neutral-500 py-6 text-center font-mono">
                   Calculating conflict-free candidate slots via CSP Engine...
@@ -540,38 +614,45 @@ export default function CandidatePortalPage() {
               ) : recommendedSlots.length === 0 ? (
                 <div className="py-8 text-center space-y-2">
                   <p className="text-xs text-neutral-600 font-medium">
-                    No eligible unbooked slots available for this drive right now.
+                    No additional unbooked slots available for this drive right now.
                   </p>
                   <p className="text-xs text-neutral-400">
-                    Ensure you have submitted availability matching the drive date and that the coordinator has approved your eligibility.
+                    Ensure you have submitted availability matching the drive date and that prerequisite rounds are completed or scheduled.
                   </p>
                 </div>
               ) : (
                 <div className="space-y-3">
                   <p className="text-xs text-neutral-600">
-                    Select an available slot below. Slots are verified against interviewer skills, panel capacity, and venue availability:
+                    Select an available slot below for{' '}
+                    <strong>{recommendedSlots[0]?.roundName || 'Next Round'}</strong>. Slots are verified against interviewer skills, panel capacity, and venue availability:
                   </p>
-                  <div className="space-y-2.5">
+                  <div className="space-y-2.5 max-h-96 overflow-y-auto pr-1">
                     {recommendedSlots.map((slot: any, idx: number) => (
                       <div
                         key={idx}
                         className="p-3.5 rounded border border-neutral-200 bg-neutral-50 flex items-center justify-between gap-3"
                       >
                         <div>
-                          <p className="font-bold text-xs text-neutral-950">
-                            {new Date(slot.startMs).toISOString().slice(11, 16)}–
-                            {new Date(slot.endMs).toISOString().slice(11, 16)} UTC (
-                            {new Date(slot.startMs).toISOString().slice(0, 10)})
-                          </p>
-                          <p className="text-xs text-neutral-600 mt-0.5">
-                            Venue: <strong>{slot.roomName}</strong> · Panel: [{slot.interviewerNames.join(', ')}]
+                          <div className="flex items-center gap-2">
+                            <span className="px-2 py-0.5 rounded bg-neutral-200 text-neutral-900 font-mono text-[10px] font-semibold">
+                              {slot.roundName}
+                            </span>
+                            <p className="font-bold text-xs text-neutral-950 font-mono">
+                              {new Date(slot.startMs).toISOString().slice(11, 16)}–
+                              {new Date(slot.endMs).toISOString().slice(11, 16)} UTC (
+                              {new Date(slot.startMs).toISOString().slice(0, 10)})
+                            </p>
+                          </div>
+                          <p className="text-xs text-neutral-600 mt-1">
+                            Venue: <strong>{slot.roomName}</strong> · Panel: [
+                            {slot.interviewerNames.join(', ')}]
                           </p>
                         </div>
                         <button
                           type="button"
                           disabled={bookingInProgress}
                           onClick={() => handleSelfBookSlot(slot)}
-                          className="px-4 py-2 rounded bg-neutral-950 text-white text-xs font-semibold hover:bg-neutral-800 disabled:opacity-50 transition"
+                          className="px-4 py-2 rounded bg-neutral-950 text-white text-xs font-semibold hover:bg-neutral-800 disabled:opacity-50 transition shrink-0"
                         >
                           {bookingInProgress ? 'Reserving...' : 'Book Slot'}
                         </button>
@@ -586,7 +667,6 @@ export default function CandidatePortalPage() {
       )}
 
       {/* ==================== TAB 4: PROFILE & CV WORKFLOW ==================== */}
-      {/* Mandated CV Upload under Profile per Sketch 2.jpeg */}
       {activeTab === 'Profile' && (
         <div className="max-w-xl space-y-6">
           <div>
@@ -597,7 +677,10 @@ export default function CandidatePortalPage() {
           </div>
 
           {/* Academic Details Form */}
-          <form onSubmit={handleSaveProfile} className="bg-white border border-neutral-200 rounded-lg p-6 space-y-4">
+          <form
+            onSubmit={handleSaveProfile}
+            className="bg-white border border-neutral-200 rounded-lg p-6 space-y-4"
+          >
             <h2 className="text-sm font-bold text-neutral-950 border-b border-neutral-100 pb-2">
               Academic Credentials
             </h2>
@@ -675,7 +758,7 @@ export default function CandidatePortalPage() {
             </button>
           </form>
 
-          {/* CV Upload Section (per Sketch 2.jpeg) */}
+          {/* CV Upload Section */}
           <div className="bg-white border border-neutral-200 rounded-lg p-6 space-y-4">
             <h2 className="text-sm font-bold text-neutral-950 border-b border-neutral-100 pb-2">
               Curriculum Vitae (PDF)
@@ -694,20 +777,9 @@ export default function CandidatePortalPage() {
                 </div>
                 <button
                   type="button"
-                  onClick={async () => {
-                    try {
-                      const token = getStoredToken();
-                      const res = await fetch(`${API_BASE}/profile/cv/${user._id}`, {
-                        headers: token ? { Authorization: `Bearer ${token}` } : {},
-                      });
-                      if (!res.ok) throw new Error('Failed to download CV');
-                      const blob = await res.blob();
-                      const url = URL.createObjectURL(blob);
-                      window.open(url, '_blank');
-                    } catch (e) {
-                      alert((e as Error).message);
-                    }
-                  }}
+                  onClick={() =>
+                    downloadCandidateCV(candidateUserId).catch((e) => setErrorMessage(e.message))
+                  }
                   className="px-3.5 py-1.5 rounded border border-neutral-950 text-xs font-semibold text-neutral-950 hover:bg-neutral-100"
                 >
                   Download PDF
@@ -721,7 +793,9 @@ export default function CandidatePortalPage() {
 
             <form onSubmit={handleUploadCV} className="space-y-3 pt-2">
               <label className="block text-xs font-semibold mb-1">
-                {dashboardData.profile?.cvMetadata?.storedFileName ? 'Replace CV (PDF only, max 5MB)' : 'Upload CV (PDF only, max 5MB)'}
+                {dashboardData.profile?.cvMetadata?.storedFileName
+                  ? 'Replace CV (PDF only, max 5MB)'
+                  : 'Upload CV (PDF only, max 5MB)'}
               </label>
               <input
                 type="file"
@@ -744,4 +818,3 @@ export default function CandidatePortalPage() {
     </ApplicationShell>
   );
 }
-

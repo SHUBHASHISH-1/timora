@@ -14,4 +14,3 @@
   "include": ["src/**/*", "../shared/**/*", "tests/**/*"],
   "exclude": ["node_modules", "dist"]
 }
-

@@ -4,7 +4,7 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { ApplicationShell } from '@/components/ApplicationShell';
 import { ScheduleCalendar } from '@/components/ScheduleCalendar';
-import { apiFetch, getStoredToken } from '@/lib/api';
+import { apiFetch, downloadCandidateCV, downloadScheduleICS } from '@/lib/api';
 
 export default function InterviewerPortalPage() {
   const router = useRouter();
@@ -15,7 +15,7 @@ export default function InterviewerPortalPage() {
   const [actionMessage, setActionMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
 
-  // Dashboard Toggle: 'Upcoming' vs 'Completed' (per Sketch WhatsApp Image 2026-10-26 at 20.23.10)
+  // Dashboard Toggle: 'Upcoming' vs 'Completed'
   const [listFilter, setListFilter] = useState<'UPCOMING' | 'COMPLETED'>('UPCOMING');
 
   // Availability Update State
@@ -34,8 +34,12 @@ export default function InterviewerPortalPage() {
   const [scoreTechDepth, setScoreTechDepth] = useState(80);
   const [scoreCommunication, setScoreCommunication] = useState(85);
   const [recommendation, setRecommendation] = useState<'STRONG_HIRE' | 'HIRE' | 'HOLD' | 'NO_HIRE'>('HIRE');
-  const [strengths, setStrengths] = useState('Strong data structures foundations, clean modular algorithmic coding.');
-  const [improvements, setImprovements] = useState('Could optimize space complexity from O(N) to O(1) in round 2.');
+  const [strengths, setStrengths] = useState(
+    'Strong data structures foundations, clean modular algorithmic coding.'
+  );
+  const [improvements, setImprovements] = useState(
+    'Could optimize space complexity from O(N) to O(1) in round 2.'
+  );
   const [submittingFeedback, setSubmittingFeedback] = useState(false);
 
   // Profile Form State
@@ -82,14 +86,43 @@ export default function InterviewerPortalPage() {
       const startMs = new Date(`${availDate}T${availStartTime}:00.000Z`).getTime();
       const endMs = new Date(`${availDate}T${availEndTime}:00.000Z`).getTime();
 
+      const existing = (dashboardData.availability || []).map((w: any) => ({
+        startMs: w.startMs,
+        endMs: w.endMs,
+      }));
+      const merged = [
+        ...existing.filter((w: any) => !(w.startMs === startMs && w.endMs === endMs)),
+        { startMs, endMs },
+      ];
+
       await apiFetch('/availability', {
         method: 'PUT',
         body: JSON.stringify({
-          windows: [{ startMs, endMs }],
+          windows: merged,
         }),
       });
 
-      setActionMessage('Availability schedule updated successfully.');
+      setActionMessage('Availability window added to your schedule.');
+      await loadData();
+    } catch (err) {
+      setErrorMessage((err as Error).message);
+    }
+  };
+
+  const handleRemoveAvailabilityWindow = async (idxToRemove: number) => {
+    try {
+      const remaining = (dashboardData.availability || [])
+        .filter((_: any, idx: number) => idx !== idxToRemove)
+        .map((w: any) => ({ startMs: w.startMs, endMs: w.endMs }));
+
+      await apiFetch('/availability', {
+        method: 'PUT',
+        body: JSON.stringify({
+          windows: remaining,
+        }),
+      });
+
+      setActionMessage('Availability window removed.');
       await loadData();
     } catch (err) {
       setErrorMessage((err as Error).message);
@@ -220,16 +253,24 @@ export default function InterviewerPortalPage() {
       )}
 
       {/* ==================== TAB 1: DASHBOARD ==================== */}
-      {/* Matches WhatsApp Image 2026-10-26 at 20.23.10.jpeg */}
       {activeTab === 'Dashboard' && (
         <div className="space-y-6">
-          <div>
-            <h1 className="text-2xl font-bold text-neutral-950 tracking-tight">
-              Welcome back, {user.name.split(' ')[0]}
-            </h1>
-            <p className="text-sm text-neutral-500">
-              Interviewer Panel Dashboard · {dashboardData.profile?.company || 'Corporate Partner'}
-            </p>
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h1 className="text-2xl font-bold text-neutral-950 tracking-tight">
+                Welcome back, {user.name.split(' ')[0]}
+              </h1>
+              <p className="text-sm text-neutral-500">
+                Interviewer Panel Dashboard · {dashboardData.profile?.company || 'Corporate Partner'}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => downloadScheduleICS().catch((e) => setErrorMessage(e.message))}
+              className="px-3.5 py-2 rounded-md border border-neutral-300 bg-white text-neutral-900 text-xs font-semibold hover:bg-neutral-100 transition"
+            >
+              Export My .ICS Calendar
+            </button>
           </div>
 
           {/* Top Nearest Interview Banner */}
@@ -251,7 +292,17 @@ export default function InterviewerPortalPage() {
                   <span>Drive: {nearestInterview.companyName}</span>
                 </div>
               </div>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() =>
+                    downloadCandidateCV(nearestInterview.candidateId).catch((e) =>
+                      setErrorMessage(e.message)
+                    )
+                  }
+                  className="px-3.5 py-2 rounded border border-neutral-700 text-neutral-200 text-xs font-medium hover:bg-neutral-800 transition"
+                >
+                  Candidate CV
+                </button>
                 <button
                   onClick={() => setFeedbackSession(nearestInterview)}
                   className="px-4 py-2 rounded bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-100 transition"
@@ -272,7 +323,7 @@ export default function InterviewerPortalPage() {
             </div>
           )}
 
-          {/* Upcoming & Completed Toggles (from sketch) */}
+          {/* Upcoming & Completed Toggles */}
           <div className="bg-white border border-neutral-200 rounded-lg p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-neutral-100 pb-3">
               <div className="flex items-center gap-2">
@@ -305,7 +356,7 @@ export default function InterviewerPortalPage() {
               </span>
             </div>
 
-            {/* Time-Ordered List (from sketch: 1., 2., 3. According to time) */}
+            {/* Time-Ordered List */}
             <div className="divide-y divide-neutral-100">
               {(listFilter === 'UPCOMING' ? upcomingSessions : completedSessions).length === 0 ? (
                 <p className="text-xs text-neutral-500 py-6 text-center">
@@ -342,6 +393,17 @@ export default function InterviewerPortalPage() {
                       </div>
 
                       <div className="flex items-center gap-2 self-end sm:self-center">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            downloadCandidateCV(s.candidateId).catch((e) =>
+                              setErrorMessage(e.message)
+                            )
+                          }
+                          className="px-2.5 py-1.5 rounded border border-neutral-300 text-neutral-700 text-xs font-medium hover:bg-neutral-100 transition"
+                        >
+                          CV PDF
+                        </button>
                         {s.status === 'Scheduled' && (
                           <>
                             <button
@@ -438,7 +500,7 @@ export default function InterviewerPortalPage() {
               type="submit"
               className="px-5 py-2.5 rounded bg-neutral-950 text-white text-xs font-semibold hover:bg-neutral-800 transition"
             >
-              Update Availability
+              + Add Availability Window
             </button>
           </form>
 
@@ -452,10 +514,19 @@ export default function InterviewerPortalPage() {
             ) : (
               <ul className="text-xs font-mono divide-y divide-neutral-100">
                 {dashboardData.availability.map((w: any, idx: number) => (
-                  <li key={idx} className="py-2">
-                    {new Date(w.startMs).toISOString().slice(11, 16)}–
-                    {new Date(w.endMs).toISOString().slice(11, 16)} UTC (
-                    {new Date(w.startMs).toISOString().slice(0, 10)})
+                  <li key={idx} className="py-2 flex items-center justify-between">
+                    <span>
+                      {new Date(w.startMs).toISOString().slice(11, 16)}–
+                      {new Date(w.endMs).toISOString().slice(11, 16)} UTC (
+                      {new Date(w.startMs).toISOString().slice(0, 10)})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveAvailabilityWindow(idx)}
+                      className="text-red-600 hover:text-red-800 text-[11px] font-sans font-medium"
+                    >
+                      Remove
+                    </button>
                   </li>
                 ))}
               </ul>
@@ -487,7 +558,9 @@ export default function InterviewerPortalPage() {
                     </span>
                   </div>
                   <p className="text-xs text-neutral-600">Round: {f.roundName}</p>
-                  <p className="text-xs text-neutral-600">Recommendation: <strong>{f.recommendation}</strong></p>
+                  <p className="text-xs text-neutral-600">
+                    Recommendation: <strong>{f.recommendation}</strong>
+                  </p>
                   <p className="text-xs text-neutral-700 bg-neutral-50 p-2 rounded border border-neutral-100">
                     Strengths: {f.strengths}
                   </p>
@@ -511,7 +584,10 @@ export default function InterviewerPortalPage() {
             </p>
           </div>
 
-          <form onSubmit={handleSaveProfile} className="bg-white border border-neutral-200 rounded-lg p-6 space-y-4">
+          <form
+            onSubmit={handleSaveProfile}
+            className="bg-white border border-neutral-200 rounded-lg p-6 space-y-4"
+          >
             <div>
               <label className="block text-xs font-semibold mb-1">Full Name</label>
               <input
@@ -630,12 +706,25 @@ export default function InterviewerPortalPage() {
                   Candidate: {feedbackSession.candidateName} · {feedbackSession.companyName}
                 </p>
               </div>
-              <button
-                onClick={() => setFeedbackSession(null)}
-                className="text-xs text-neutral-400 hover:text-neutral-900"
-              >
-                ✕
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    downloadCandidateCV(feedbackSession.candidateId).catch((e) =>
+                      setErrorMessage(e.message)
+                    )
+                  }
+                  className="px-2.5 py-1 rounded border border-neutral-300 text-xs font-semibold text-neutral-900 hover:bg-neutral-100"
+                >
+                  View CV
+                </button>
+                <button
+                  onClick={() => setFeedbackSession(null)}
+                  className="text-xs text-neutral-400 hover:text-neutral-900 px-1"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
 
             <form onSubmit={handleSubmitFeedback} className="space-y-3.5">
@@ -736,4 +825,3 @@ export default function InterviewerPortalPage() {
     </ApplicationShell>
   );
 }
-

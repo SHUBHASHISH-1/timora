@@ -1,7 +1,6 @@
 // backend/src/seed/seed.ts
 
 import bcrypt from 'bcryptjs';
-import mongoose from 'mongoose';
 import { connectDatabase, closeDatabase } from '../config/db';
 import {
   UserModel,
@@ -266,10 +265,22 @@ async function seed() {
       actorName: admin.name,
       actorRole: 'ADMIN',
       action: 'SEED_INITIALIZED',
-      details: 'Initialized demo placement drive "SDE Campus Drive 2026" (Northwind Labs) with 3 candidates, 3 interviewers, and 3 rooms.',
+      details:
+        'Initialized demo placement drive "SDE Campus Drive 2026" (Northwind Labs) with 3 candidates, 3 interviewers, and 3 rooms.',
     });
   } else {
-    console.log('[SEED] Placement Drive already exists: SDE Campus Drive 2026 (skipped)');
+    // Clean up any existing mojibake in seeded drive round names if already seeded earlier
+    let updatedRounds = false;
+    for (const round of drive.rounds) {
+      if (round.name.includes('â€”')) {
+        round.name = round.name.replace(/â€”/g, '—');
+        updatedRounds = true;
+      }
+    }
+    if (updatedRounds) {
+      await drive.save();
+    }
+    console.log('[SEED] Placement Drive already exists: SDE Campus Drive 2026 (verified)');
   }
 
   console.log('[TIMORA SEED] Completed successfully!');

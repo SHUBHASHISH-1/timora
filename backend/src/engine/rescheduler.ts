@@ -6,6 +6,7 @@ import {
   ExistingReservation,
   InterviewVariable,
   RescheduleResult,
+  TimeWindow,
 } from '../../../shared/types/csp';
 import { TimoraCSPSolver } from './cspSolver';
 import { IndependentScheduleValidator } from './scheduleValidator';
@@ -21,16 +22,24 @@ export class LocalizedRescheduler {
     fullProblemContext: CSPProblemInput,
     unaffectedAssignments: CandidateSlotAssignment[]
   ): RescheduleResult {
+    const varMap = new Map(fullProblemContext.variables.map((v) => [v.id, v]));
+
     // Convert all unaffected assignments into locked reservations so global schedule is untouched
     const lockedReservations: ExistingReservation[] = [
       ...fullProblemContext.existingReservations,
-      ...unaffectedAssignments.map((a) => ({
-        sessionId: a.variableId,
-        candidateId: a.candidateId,
-        interviewerIds: a.interviewerIds,
-        roomId: a.roomId,
-        window: { startMs: a.startMs, endMs: a.effectiveEndMs },
-      })),
+      ...unaffectedAssignments.map((a) => {
+        const aVar = varMap.get(a.variableId);
+        return {
+          sessionId: a.variableId,
+          candidateId: a.candidateId,
+          interviewerIds: a.interviewerIds,
+          roomId: a.roomId,
+          window: { startMs: a.startMs, endMs: a.effectiveEndMs },
+          driveId: a.driveId,
+          roundId: a.roundId,
+          roundOrder: aVar?.roundOrder,
+        };
+      }),
     ];
 
     // Filter out the dropped interviewer from eligible interviewers for this slot
@@ -85,9 +94,44 @@ export class LocalizedRescheduler {
     }
 
     // Attempt 2: Shift time/room/interviewer for this single interview without touching others
+    // Enforce multi-round ordering bounds against the candidate's other locked rounds in the same drive
+    let minStartMs = -Infinity;
+    let maxEndMs = Infinity;
+
+    for (const other of unaffectedAssignments) {
+      if (other.candidateId !== variable.candidateId || other.driveId !== variable.driveId) continue;
+      const otherVar = varMap.get(other.variableId);
+      if (!otherVar) continue;
+
+      if (
+        variable.prerequisiteRoundId === other.roundId ||
+        otherVar.roundOrder < variable.roundOrder
+      ) {
+        minStartMs = Math.max(minStartMs, other.endMs);
+      }
+      if (
+        otherVar.prerequisiteRoundId === variable.roundId ||
+        otherVar.roundOrder > variable.roundOrder
+      ) {
+        maxEndMs = Math.min(maxEndMs, other.startMs);
+      }
+    }
+
+    const boundedWindows: TimeWindow[] = variable.allowedTimeWindows
+      .map((w) => ({
+        startMs: Math.max(w.startMs, minStartMs),
+        endMs: Math.min(w.endMs, maxEndMs),
+      }))
+      .filter((w) => w.endMs > w.startMs);
+
+    const shiftVariable: InterviewVariable = {
+      ...variable,
+      allowedTimeWindows: boundedWindows,
+    };
+
     const shiftProblem: CSPProblemInput = {
       ...fullProblemContext,
-      variables: [variable],
+      variables: [shiftVariable],
       interviewers: updatedInterviewers,
       existingReservations: lockedReservations,
     };
@@ -120,4 +164,3 @@ export class LocalizedRescheduler {
     };
   }
 }
-

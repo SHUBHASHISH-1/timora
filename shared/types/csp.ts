@@ -64,6 +64,9 @@ export interface ExistingReservation {
   interviewerIds: string[];
   roomId: string;
   window: TimeWindow;
+  driveId?: string;
+  roundId?: string;
+  roundOrder?: number;
 }
 
 export interface CandidateSlotAssignment {
@@ -142,7 +145,8 @@ export interface HardConstraintViolation {
     | 'INVALID_DURATION'
     | 'ROUND_DEPENDENCY_VIOLATION'
     | 'CANDIDATE_NOT_ELIGIBLE'
-    | 'PANEL_SIZE_MISMATCH';
+    | 'PANEL_SIZE_MISMATCH'
+    | 'INTERVIEWER_DAILY_CAP_EXCEEDED';
   variableId: string;
   message: string;
   conflictingVariableId?: string;
@@ -162,4 +166,3 @@ export interface RescheduleResult {
   validationReport?: ScheduleValidationReport;
   blockingReason?: string;
 }
-

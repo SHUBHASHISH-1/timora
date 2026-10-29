@@ -2,7 +2,7 @@
 
 import path from 'path';
 import fs from 'fs';
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import {
@@ -23,10 +23,12 @@ import { TimoraCSPSolver, intervalsOverlap, isContainedInAny } from '../engine/c
 import { IndependentScheduleValidator } from '../engine/scheduleValidator';
 import { LocalizedRescheduler } from '../engine/rescheduler';
 import { generateNaturalLanguageScheduleSummary } from '../services/geminiService';
+import { generateICSFeed } from '../services/icsService';
 import {
   CSPProblemInput,
   CandidateSlotAssignment,
   InterviewVariable,
+  TimeWindow,
 } from '../../../shared/types/csp';
 import { env } from '../config/env';
 
@@ -34,6 +36,30 @@ export const apiRouter = Router();
 const solver = new TimoraCSPSolver();
 const validator = new IndependentScheduleValidator();
 const rescheduler = new LocalizedRescheduler();
+
+// Express 4 async wrapper to ensure every rejected promise reaches centralized error middleware
+const asyncHandler =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<void>) =>
+  (req: Request, res: Response, next: NextFunction): void => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+
+// In-process atomic mutex for serializing concurrent self-booking requests
+let selfBookingLock: Promise<void> = Promise.resolve();
+async function withSelfBookingLock<T>(fn: () => Promise<T>): Promise<T> {
+  let release!: () => void;
+  const nextLock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const previousLock = selfBookingLock;
+  selfBookingLock = previousLock.then(() => nextLock);
+  await previousLock;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 // ============================================================================
 // 1. AUTHENTICATION & PROFILE ROUTES
@@ -45,8 +71,9 @@ const loginSchema = z.object({
   role: z.enum(['ADMIN', 'INTERVIEWER', 'CANDIDATE']).optional(),
 });
 
-apiRouter.post('/auth/login', async (req: Request, res: Response) => {
-  try {
+apiRouter.post(
+  '/auth/login',
+  asyncHandler(async (req: Request, res: Response) => {
     const parsed = loginSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid email or password format.', details: parsed.error.issues });
@@ -90,35 +117,40 @@ apiRouter.post('/auth/login', async (req: Request, res: Response) => {
     });
 
     res.json({ token, user: tokenPayload });
-  } catch (err) {
-    res.status(500).json({ error: 'Authentication failed.', message: (err as Error).message });
-  }
-});
+  })
+);
 
-apiRouter.get('/auth/me', authenticate, async (req: Request, res: Response) => {
-  const user = await UserModel.findById(req.user!.userId).select('-passwordHash');
-  if (!user) {
-    res.status(404).json({ error: 'User not found.' });
-    return;
-  }
+apiRouter.get(
+  '/auth/me',
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const user = await UserModel.findById(req.user!.userId).select('-passwordHash');
+    if (!user) {
+      res.status(404).json({ error: 'User not found.' });
+      return;
+    }
 
-  let candidateProfile = null;
-  let interviewerProfile = null;
-  if (user.role === 'CANDIDATE') {
-    candidateProfile = await CandidateProfileModel.findOne({ userId: user._id });
-  } else if (user.role === 'INTERVIEWER') {
-    interviewerProfile = await InterviewerProfileModel.findOne({ userId: user._id });
-  }
+    let candidateProfile = null;
+    let interviewerProfile = null;
+    if (user.role === 'CANDIDATE') {
+      candidateProfile = await CandidateProfileModel.findOne({ userId: user._id });
+    } else if (user.role === 'INTERVIEWER') {
+      interviewerProfile = await InterviewerProfileModel.findOne({ userId: user._id });
+    }
 
-  const availability = await AvailabilityModel.findOne({ userId: user._id });
+    const availability = await AvailabilityModel.findOne({ userId: user._id });
 
-  res.json({
-    user,
-    candidateProfile,
-    interviewerProfile,
-    availability: availability?.windows ?? [],
-  });
-});
+    res.json({
+      user: {
+        ...user.toObject(),
+        userId: String(user._id),
+      },
+      candidateProfile,
+      interviewerProfile,
+      availability: availability?.windows ?? [],
+    });
+  })
+);
 
 const updateProfileSchema = z.object({
   name: z.string().min(2).optional(),
@@ -133,56 +165,60 @@ const updateProfileSchema = z.object({
   maxInterviewsPerDay: z.number().min(1).max(15).optional(),
 });
 
-apiRouter.put('/profile', authenticate, async (req: Request, res: Response) => {
-  const parsed = updateProfileSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: 'Invalid profile update payload.', details: parsed.error.issues });
-    return;
-  }
+apiRouter.put(
+  '/profile',
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const parsed = updateProfileSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid profile update payload.', details: parsed.error.issues });
+      return;
+    }
 
-  const data = parsed.data;
-  const user = await UserModel.findById(req.user!.userId);
-  if (!user) {
-    res.status(404).json({ error: 'User not found.' });
-    return;
-  }
+    const data = parsed.data;
+    const user = await UserModel.findById(req.user!.userId);
+    if (!user) {
+      res.status(404).json({ error: 'User not found.' });
+      return;
+    }
 
-  if (data.name) user.name = data.name;
-  if (data.phone !== undefined) user.phone = data.phone;
-  if (data.department !== undefined) user.department = data.department;
-  await user.save();
+    if (data.name) user.name = data.name;
+    if (data.phone !== undefined) user.phone = data.phone;
+    if (data.department !== undefined) user.department = data.department;
+    await user.save();
 
-  if (user.role === 'CANDIDATE') {
-    await CandidateProfileModel.findOneAndUpdate(
-      { userId: user._id },
-      {
-        $set: {
-          ...(data.degree ? { degree: data.degree } : {}),
-          ...(data.branch ? { branch: data.branch } : {}),
-          ...(data.graduationYear ? { graduationYear: data.graduationYear } : {}),
-          ...(data.cgpa !== undefined ? { cgpa: data.cgpa } : {}),
-          ...(data.skills ? { skills: data.skills } : {}),
+    if (user.role === 'CANDIDATE') {
+      await CandidateProfileModel.findOneAndUpdate(
+        { userId: user._id },
+        {
+          $set: {
+            ...(data.degree ? { degree: data.degree } : {}),
+            ...(data.branch ? { branch: data.branch } : {}),
+            ...(data.graduationYear ? { graduationYear: data.graduationYear } : {}),
+            ...(data.cgpa !== undefined ? { cgpa: data.cgpa } : {}),
+            ...(data.skills ? { skills: data.skills } : {}),
+          },
         },
-      },
-      { new: true, upsert: true }
-    );
-  } else if (user.role === 'INTERVIEWER') {
-    await InterviewerProfileModel.findOneAndUpdate(
-      { userId: user._id },
-      {
-        $set: {
-          ...(data.company ? { company: data.company } : {}),
-          ...(data.department ? { department: data.department } : {}),
-          ...(data.skills ? { skills: data.skills } : {}),
-          ...(data.maxInterviewsPerDay ? { maxInterviewsPerDay: data.maxInterviewsPerDay } : {}),
+        { new: true, upsert: true }
+      );
+    } else if (user.role === 'INTERVIEWER') {
+      await InterviewerProfileModel.findOneAndUpdate(
+        { userId: user._id },
+        {
+          $set: {
+            ...(data.company ? { company: data.company } : {}),
+            ...(data.department ? { department: data.department } : {}),
+            ...(data.skills ? { skills: data.skills } : {}),
+            ...(data.maxInterviewsPerDay ? { maxInterviewsPerDay: data.maxInterviewsPerDay } : {}),
+          },
         },
-      },
-      { new: true, upsert: true }
-    );
-  }
+        { new: true, upsert: true }
+      );
+    }
 
-  res.json({ message: 'Profile updated successfully.' });
-});
+    res.json({ message: 'Profile updated successfully.' });
+  })
+);
 
 // Candidate CV Upload (Inside Candidate Profile)
 apiRouter.post(
@@ -198,7 +234,7 @@ apiRouter.post(
       next();
     });
   },
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     if (!req.file) {
       res.status(400).json({ error: 'Please select a valid PDF file to upload.' });
       return;
@@ -210,11 +246,14 @@ apiRouter.post(
       return;
     }
 
-    // Delete previous file if replacing
     if (profile.cvMetadata?.storedFileName) {
       const oldPath = path.resolve(env.UPLOAD_DIR, profile.cvMetadata.storedFileName);
       if (fs.existsSync(oldPath)) {
-        fs.unlinkSync(oldPath);
+        try {
+          fs.unlinkSync(oldPath);
+        } catch {
+          // Ignore file lock cleanup errors
+        }
       }
     }
 
@@ -235,44 +274,48 @@ apiRouter.post(
     });
 
     res.json({ message: 'CV uploaded successfully.', cvMetadata: profile.cvMetadata });
-  }
+  })
 );
 
 // Secure CV Download (Authorized for Owner Candidate, Assigned Interviewer, or Admin)
-apiRouter.get('/profile/cv/:candidateUserId', authenticate, async (req: Request, res: Response) => {
-  const { candidateUserId } = req.params;
-  const requester = req.user!;
+apiRouter.get(
+  '/profile/cv/:candidateUserId',
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const { candidateUserId } = req.params;
+    const requester = req.user!;
 
-  if (requester.role === 'CANDIDATE' && requester.userId !== candidateUserId) {
-    res.status(403).json({ error: 'Forbidden. Candidates may only access their own CV.' });
-    return;
-  }
-
-  if (requester.role === 'INTERVIEWER') {
-    const hasAssignedInterview = await InterviewSessionModel.exists({
-      candidateId: candidateUserId,
-      interviewerIds: requester.userId,
-    });
-    if (!hasAssignedInterview) {
-      res.status(403).json({ error: 'Forbidden. You are not assigned to interview this candidate.' });
+    if (requester.role === 'CANDIDATE' && requester.userId !== candidateUserId) {
+      res.status(403).json({ error: 'Forbidden. Candidates may only access their own CV.' });
       return;
     }
-  }
 
-  const profile = await CandidateProfileModel.findOne({ userId: candidateUserId });
-  if (!profile?.cvMetadata?.storedFileName) {
-    res.status(404).json({ error: 'No CV uploaded for this candidate.' });
-    return;
-  }
+    if (requester.role === 'INTERVIEWER') {
+      const hasAssignedInterview = await InterviewSessionModel.exists({
+        candidateId: candidateUserId,
+        interviewerIds: requester.userId,
+      });
+      if (!hasAssignedInterview) {
+        res.status(403).json({ error: 'Forbidden. You are not assigned to interview this candidate.' });
+        return;
+      }
+    }
 
-  const filePath = path.resolve(env.UPLOAD_DIR, profile.cvMetadata.storedFileName);
-  if (!fs.existsSync(filePath)) {
-    res.status(404).json({ error: 'CV file not found on disk.' });
-    return;
-  }
+    const profile = await CandidateProfileModel.findOne({ userId: candidateUserId });
+    if (!profile?.cvMetadata?.storedFileName) {
+      res.status(404).json({ error: 'No CV uploaded for this candidate.' });
+      return;
+    }
 
-  res.download(filePath, profile.cvMetadata.originalName);
-});
+    const filePath = path.resolve(env.UPLOAD_DIR, profile.cvMetadata.storedFileName);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'CV file not found on disk.' });
+      return;
+    }
+
+    res.download(filePath, profile.cvMetadata.originalName);
+  })
+);
 
 // ============================================================================
 // 2. AVAILABILITY MANAGEMENT
@@ -292,67 +335,88 @@ const availabilitySchema = z.object({
     }),
 });
 
-apiRouter.put('/availability', authenticate, async (req: Request, res: Response) => {
-  const parsed = availabilitySchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: 'Invalid availability windows.', details: parsed.error.issues });
-    return;
-  }
+apiRouter.put(
+  '/availability',
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const parsed = availabilitySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid availability windows.', details: parsed.error.issues });
+      return;
+    }
 
-  // Interviewer and Candidate availability can only be modified by the owning authenticated user.
-  // Admins must not directly edit an interviewer's availability.
-  if (req.user!.role === 'ADMIN') {
-    res.status(403).json({
-      error: 'Admins cannot directly edit interviewer or candidate availability. Panel members and candidates manage their own availability.',
-    });
-    return;
-  }
+    if (req.user!.role === 'ADMIN') {
+      res.status(403).json({
+        error:
+          'Admins cannot directly edit interviewer or candidate availability. Panel members and candidates manage their own availability.',
+      });
+      return;
+    }
 
-  const targetUserId = req.user!.userId;
-  const targetUser = await UserModel.findById(targetUserId);
-  if (!targetUser) {
-    res.status(404).json({ error: 'Target user not found.' });
-    return;
-  }
+    const targetUserId = req.user!.userId;
+    const targetUser = await UserModel.findById(targetUserId);
+    if (!targetUser) {
+      res.status(404).json({ error: 'Target user not found.' });
+      return;
+    }
 
-  // If interviewer modifies availability, validate that existing scheduled sessions fall within the new windows
-  if (targetUser.role === 'INTERVIEWER') {
-    const activeSessions = await InterviewSessionModel.find({
-      interviewerIds: targetUserId,
-      status: 'Scheduled',
-    });
+    if (targetUser.role === 'INTERVIEWER') {
+      const activeSessions = await InterviewSessionModel.find({
+        interviewerIds: targetUserId,
+        status: 'Scheduled',
+      });
 
-    for (const session of activeSessions) {
-      const isContained = isContainedInAny(session.startMs, session.effectiveEndMs, parsed.data.windows);
-      if (!isContained) {
-        res.status(409).json({
-          error: `Cannot update availability: Your confirmed session for "${session.roundName}" with candidate ${session.candidateName} (${new Date(session.startMs).toISOString().slice(11, 16)}–${new Date(session.endMs).toISOString().slice(11, 16)} UTC) falls outside the updated windows. Please request a rescheduling before removing this slot.`,
-        });
-        return;
+      for (const session of activeSessions) {
+        const isContained = isContainedInAny(
+          session.startMs,
+          session.effectiveEndMs,
+          parsed.data.windows
+        );
+        if (!isContained) {
+          res.status(409).json({
+            error: `Cannot update availability: Your confirmed session for "${session.roundName}" with candidate ${session.candidateName} (${new Date(session.startMs).toISOString().slice(11, 16)}–${new Date(session.endMs).toISOString().slice(11, 16)} UTC on ${new Date(session.startMs).toISOString().slice(0, 10)}) falls outside the updated windows. Use Emergency Cancellation if you need to drop that slot.`,
+          });
+          return;
+        }
+      }
+    } else if (targetUser.role === 'CANDIDATE') {
+      const activeSessions = await InterviewSessionModel.find({
+        candidateId: targetUserId,
+        status: 'Scheduled',
+      });
+
+      for (const session of activeSessions) {
+        const isContained = isContainedInAny(session.startMs, session.endMs, parsed.data.windows);
+        if (!isContained) {
+          res.status(409).json({
+            error: `Cannot update availability: You have a scheduled interview for "${session.roundName}" (${new Date(session.startMs).toISOString().slice(11, 16)}–${new Date(session.endMs).toISOString().slice(11, 16)} UTC on ${new Date(session.startMs).toISOString().slice(0, 10)}) that falls outside the updated windows.`,
+          });
+          return;
+        }
       }
     }
-  }
 
-  const updated = await AvailabilityModel.findOneAndUpdate(
-    { userId: targetUser._id },
-    {
-      $set: {
-        role: targetUser.role,
-        windows: parsed.data.windows,
+    const updated = await AvailabilityModel.findOneAndUpdate(
+      { userId: targetUser._id },
+      {
+        $set: {
+          role: targetUser.role,
+          windows: parsed.data.windows,
+        },
       },
-    },
-    { new: true, upsert: true }
-  );
+      { new: true, upsert: true }
+    );
 
-  await AuditLogModel.create({
-    actorName: req.user!.name,
-    actorRole: req.user!.role,
-    action: 'AVAILABILITY_UPDATED',
-    details: `Updated ${parsed.data.windows.length} availability window(s) for ${targetUser.name}.`,
-  });
+    await AuditLogModel.create({
+      actorName: req.user!.name,
+      actorRole: req.user!.role,
+      action: 'AVAILABILITY_UPDATED',
+      details: `Updated ${parsed.data.windows.length} availability window(s) for ${targetUser.name}.`,
+    });
 
-  res.json({ message: 'Availability saved.', availability: updated });
-});
+    res.json({ message: 'Availability saved.', availability: updated });
+  })
+);
 
 // ============================================================================
 // 3. ROOM MANAGEMENT
@@ -366,53 +430,86 @@ const roomSchema = z.object({
   availableWindows: z.array(z.object({ startMs: z.number(), endMs: z.number() })),
 });
 
-apiRouter.get('/rooms', authenticate, async (_req: Request, res: Response) => {
-  const rooms = await RoomModel.find().sort({ name: 1 });
-  const activeSessions = await InterviewSessionModel.find({ status: 'Scheduled' });
-  res.json({ rooms, activeSessions });
-});
+apiRouter.get(
+  '/rooms',
+  authenticate,
+  asyncHandler(async (_req: Request, res: Response) => {
+    const rooms = await RoomModel.find().sort({ name: 1 });
+    const activeSessions = await InterviewSessionModel.find({ status: 'Scheduled' });
+    res.json({ rooms, activeSessions });
+  })
+);
 
-apiRouter.post('/rooms', authenticate, requireRole('ADMIN'), async (req: Request, res: Response) => {
-  const parsed = roomSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: 'Invalid room data.', details: parsed.error.issues });
-    return;
-  }
+apiRouter.post(
+  '/rooms',
+  authenticate,
+  requireRole('ADMIN'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const parsed = roomSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid room data.', details: parsed.error.issues });
+      return;
+    }
 
-  const room = await RoomModel.create(parsed.data);
-  await AuditLogModel.create({
-    actorName: req.user!.name,
-    actorRole: 'ADMIN',
-    action: 'ROOM_CREATED',
-    details: `Configured room "${room.name}" (capacity ${room.capacity}).`,
-  });
+    // Also include allowedTimeWindows from all existing drives so new rooms work across every drive date
+    const existingDrives = await PlacementDriveModel.find({}, { allowedTimeWindows: 1 });
+    const mergedWindows: TimeWindow[] = [...parsed.data.availableWindows];
+    for (const d of existingDrives) {
+      for (const w of d.allowedTimeWindows) {
+        if (!isContainedInAny(w.startMs, w.endMs, mergedWindows)) {
+          mergedWindows.push({ startMs: w.startMs, endMs: w.endMs });
+        }
+      }
+    }
 
-  res.status(201).json({ room });
-});
-
-apiRouter.delete('/rooms/:roomId', authenticate, requireRole('ADMIN'), async (req: Request, res: Response) => {
-  const inUse = await InterviewSessionModel.exists({
-    roomId: req.params.roomId,
-    status: 'Scheduled',
-  });
-  if (inUse) {
-    res.status(409).json({
-      error: 'Cannot delete a room that has active scheduled interviews.',
+    const room = await RoomModel.create({
+      ...parsed.data,
+      availableWindows: mergedWindows,
     });
-    return;
-  }
-  await RoomModel.findByIdAndDelete(req.params.roomId);
-  res.json({ message: 'Room deleted.' });
-});
+
+    await AuditLogModel.create({
+      actorName: req.user!.name,
+      actorRole: 'ADMIN',
+      action: 'ROOM_CREATED',
+      details: `Configured room "${room.name}" (capacity ${room.capacity}).`,
+    });
+
+    res.status(201).json({ room });
+  })
+);
+
+apiRouter.delete(
+  '/rooms/:roomId',
+  authenticate,
+  requireRole('ADMIN'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const inUse = await InterviewSessionModel.exists({
+      roomId: req.params.roomId,
+      status: 'Scheduled',
+    });
+    if (inUse) {
+      res.status(409).json({
+        error: 'Cannot delete a room that has active scheduled interviews.',
+      });
+      return;
+    }
+    await RoomModel.findByIdAndDelete(req.params.roomId);
+    res.json({ message: 'Room deleted.' });
+  })
+);
 
 // ============================================================================
-// 4. PLACEMENT DRIVES & CANIDATE / INTERVIEWER ROSTERS
+// 4. PLACEMENT DRIVES & CANDIDATE / INTERVIEWER ROSTERS
 // ============================================================================
 
-apiRouter.get('/drives', authenticate, async (_req: Request, res: Response) => {
-  const drives = await PlacementDriveModel.find().sort({ createdAt: -1 });
-  res.json({ drives });
-});
+apiRouter.get(
+  '/drives',
+  authenticate,
+  asyncHandler(async (_req: Request, res: Response) => {
+    const drives = await PlacementDriveModel.find().sort({ createdAt: -1 });
+    res.json({ drives });
+  })
+);
 
 const createDriveSchema = z.object({
   title: z.string().min(3),
@@ -442,135 +539,172 @@ const createDriveSchema = z.object({
   assignedInterviewerIds: z.array(z.string()).default([]),
 });
 
-apiRouter.post('/drives', authenticate, requireRole('ADMIN'), async (req: Request, res: Response) => {
-  const parsed = createDriveSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: 'Invalid placement drive payload.', details: parsed.error.issues });
-    return;
-  }
+apiRouter.post(
+  '/drives',
+  authenticate,
+  requireRole('ADMIN'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const parsed = createDriveSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid placement drive payload.', details: parsed.error.issues });
+      return;
+    }
 
-  const drive = await PlacementDriveModel.create({
-    ...parsed.data,
-    status: 'Draft',
-  });
+    const drive = await PlacementDriveModel.create({
+      ...parsed.data,
+      status: 'Draft',
+    });
 
-  if (parsed.data.eligibleCandidateIds.length > 0) {
+    if (parsed.data.eligibleCandidateIds.length > 0) {
+      await CandidateProfileModel.updateMany(
+        { userId: { $in: parsed.data.eligibleCandidateIds } },
+        { $addToSet: { eligibleDriveIds: String(drive._id) } }
+      );
+    }
+
+    // Ensure all active rooms have availability windows covering the new drive's allowedTimeWindows
+    const activeRooms = await RoomModel.find({ isActive: true });
+    for (const room of activeRooms) {
+      let modified = false;
+      for (const w of parsed.data.allowedTimeWindows) {
+        if (!isContainedInAny(w.startMs, w.endMs, room.availableWindows)) {
+          room.availableWindows.push({ startMs: w.startMs, endMs: w.endMs });
+          modified = true;
+        }
+      }
+      if (modified) {
+        await room.save();
+      }
+    }
+
+    await AuditLogModel.create({
+      actorName: req.user!.name,
+      actorRole: 'ADMIN',
+      action: 'DRIVE_CREATED',
+      details: `Created drive "${drive.title}" for ${drive.companyName}.`,
+    });
+
+    res.status(201).json({ drive });
+  })
+);
+
+apiRouter.delete(
+  '/drives/:driveId',
+  authenticate,
+  requireRole('ADMIN'),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { driveId } = req.params;
+    const drive = await PlacementDriveModel.findById(driveId);
+    if (!drive) {
+      res.status(404).json({ error: 'Placement drive not found.' });
+      return;
+    }
+
+    const deletedSessions = await InterviewSessionModel.deleteMany({ driveId });
+    await ScheduleVersionModel.deleteMany({ driveId });
+
     await CandidateProfileModel.updateMany(
-      { userId: { $in: parsed.data.eligibleCandidateIds } },
-      { $addToSet: { eligibleDriveIds: String(drive._id) } }
+      { eligibleDriveIds: String(drive._id) },
+      { $pull: { eligibleDriveIds: String(drive._id) } }
     );
-  }
 
-  await AuditLogModel.create({
-    actorName: req.user!.name,
-    actorRole: 'ADMIN',
-    action: 'DRIVE_CREATED',
-    details: `Created drive "${drive.title}" for ${drive.companyName}.`,
-  });
+    await PlacementDriveModel.findByIdAndDelete(driveId);
 
-  res.status(201).json({ drive });
-});
+    await AuditLogModel.create({
+      actorName: req.user!.name,
+      actorRole: 'ADMIN',
+      action: 'DRIVE_DELETED',
+      details: `Deleted drive "${drive.title}" (${drive.companyName}) and purged ${deletedSessions.deletedCount} related session(s).`,
+    });
 
-apiRouter.delete('/drives/:driveId', authenticate, requireRole('ADMIN'), async (req: Request, res: Response) => {
-  const { driveId } = req.params;
-  const drive = await PlacementDriveModel.findById(driveId);
-  if (!drive) {
-    res.status(404).json({ error: 'Placement drive not found.' });
-    return;
-  }
+    res.json({
+      message: `Placement drive "${drive.title}" and ${deletedSessions.deletedCount} associated interview session(s) were successfully deleted.`,
+      deletedDriveId: driveId,
+    });
+  })
+);
 
-  // Cascade cleanup of associated schedule versions and interview sessions
-  const deletedSessions = await InterviewSessionModel.deleteMany({ driveId });
-  await ScheduleVersionModel.deleteMany({ driveId });
+apiRouter.get(
+  '/admin/overview',
+  authenticate,
+  requireRole('ADMIN'),
+  asyncHandler(async (_req: Request, res: Response) => {
+    const [
+      drives,
+      candidatesUsers,
+      candidateProfiles,
+      interviewerUsers,
+      interviewerProfiles,
+      availabilities,
+      rooms,
+      sessions,
+      scheduleVersions,
+      auditLogs,
+    ] = await Promise.all([
+      PlacementDriveModel.find().sort({ createdAt: -1 }),
+      UserModel.find({ role: 'CANDIDATE' }).select('-passwordHash'),
+      CandidateProfileModel.find(),
+      UserModel.find({ role: 'INTERVIEWER' }).select('-passwordHash'),
+      InterviewerProfileModel.find(),
+      AvailabilityModel.find(),
+      RoomModel.find(),
+      InterviewSessionModel.find().sort({ startMs: 1 }),
+      ScheduleVersionModel.find().sort({ createdAt: -1 }).limit(10),
+      AuditLogModel.find().sort({ createdAt: -1 }).limit(20),
+    ]);
 
-  // Remove drive reference from candidate profiles
-  await CandidateProfileModel.updateMany(
-    { eligibleDriveIds: String(drive._id) },
-    { $pull: { eligibleDriveIds: String(drive._id) } }
-  );
+    const availMap = new Map(availabilities.map((a) => [String(a.userId), a.windows]));
+    const candProfileMap = new Map(candidateProfiles.map((p) => [String(p.userId), p]));
+    const intProfileMap = new Map(interviewerProfiles.map((p) => [String(p.userId), p]));
 
-  await PlacementDriveModel.findByIdAndDelete(driveId);
+    const candidates = candidatesUsers.map((u) => ({
+      userId: String(u._id),
+      name: u.name,
+      email: u.email,
+      department: u.department,
+      profile: candProfileMap.get(String(u._id)) ?? null,
+      availability: availMap.get(String(u._id)) ?? [],
+    }));
 
-  await AuditLogModel.create({
-    actorName: req.user!.name,
-    actorRole: 'ADMIN',
-    action: 'DRIVE_DELETED',
-    details: `Deleted drive "${drive.title}" (${drive.companyName}) and purged ${deletedSessions.deletedCount} related session(s).`,
-  });
+    const interviewers = interviewerUsers.map((u) => ({
+      userId: String(u._id),
+      name: u.name,
+      email: u.email,
+      department: u.department,
+      profile: intProfileMap.get(String(u._id)) ?? null,
+      availability: availMap.get(String(u._id)) ?? [],
+    }));
 
-  res.json({
-    message: `Placement drive "${drive.title}" and ${deletedSessions.deletedCount} associated interview session(s) were successfully deleted.`,
-    deletedDriveId: driveId,
-  });
-});
+    res.json({
+      drives,
+      candidates,
+      interviewers,
+      rooms,
+      sessions,
+      scheduleVersions,
+      auditLogs,
+    });
+  })
+);
 
-apiRouter.get('/admin/overview', authenticate, requireRole('ADMIN'), async (_req: Request, res: Response) => {
-  const [
-    drives,
-    candidatesUsers,
-    candidateProfiles,
-    interviewerUsers,
-    interviewerProfiles,
-    availabilities,
-    rooms,
-    sessions,
-    scheduleVersions,
-    auditLogs,
-  ] = await Promise.all([
-    PlacementDriveModel.find().sort({ createdAt: -1 }),
-    UserModel.find({ role: 'CANDIDATE' }).select('-passwordHash'),
-    CandidateProfileModel.find(),
-    UserModel.find({ role: 'INTERVIEWER' }).select('-passwordHash'),
-    InterviewerProfileModel.find(),
-    AvailabilityModel.find(),
-    RoomModel.find(),
-    InterviewSessionModel.find().sort({ startMs: 1 }),
-    ScheduleVersionModel.find().sort({ createdAt: -1 }).limit(10),
-    AuditLogModel.find().sort({ createdAt: -1 }).limit(15),
-  ]);
-
-  const availMap = new Map(availabilities.map((a) => [String(a.userId), a.windows]));
-  const candProfileMap = new Map(candidateProfiles.map((p) => [String(p.userId), p]));
-  const intProfileMap = new Map(interviewerProfiles.map((p) => [String(p.userId), p]));
-
-  const candidates = candidatesUsers.map((u) => ({
-    userId: String(u._id),
-    name: u.name,
-    email: u.email,
-    department: u.department,
-    profile: candProfileMap.get(String(u._id)) ?? null,
-    availability: availMap.get(String(u._id)) ?? [],
-  }));
-
-  const interviewers = interviewerUsers.map((u) => ({
-    userId: String(u._id),
-    name: u.name,
-    email: u.email,
-    department: u.department,
-    profile: intProfileMap.get(String(u._id)) ?? null,
-    availability: availMap.get(String(u._id)) ?? [],
-  }));
-
-  res.json({
-    drives,
-    candidates,
-    interviewers,
-    rooms,
-    sessions,
-    scheduleVersions,
-    auditLogs,
-  });
+const toggleEligibilitySchema = z.object({
+  driveId: z.string(),
+  eligible: z.boolean(),
 });
 
 apiRouter.patch(
   '/admin/candidates/:candidateUserId/eligibility',
   authenticate,
   requireRole('ADMIN'),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const { candidateUserId } = req.params;
-    const { driveId, eligible } = z
-      .object({ driveId: z.string(), eligible: z.boolean() })
-      .parse(req.body);
+    const parsed = toggleEligibilitySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid eligibility payload.', details: parsed.error.issues });
+      return;
+    }
+
+    const { driveId, eligible } = parsed.data;
 
     if (eligible) {
       await CandidateProfileModel.findOneAndUpdate(
@@ -591,14 +725,17 @@ apiRouter.patch(
     }
 
     res.json({ message: 'Candidate drive eligibility updated.' });
-  }
+  })
 );
 
 // ============================================================================
 // 5. CSP SCHEDULE GENERATION, INDEPENDENT VALIDATION & PUBLICATION
 // ============================================================================
 
-async function buildCSPInputForDrive(driveId: string): Promise<{
+async function buildCSPInputForDrive(
+  driveId: string,
+  options: { preserveSelfBooked?: boolean } = { preserveSelfBooked: true }
+): Promise<{
   problemInput: CSPProblemInput;
   userMap: Map<string, string>;
   roomNameMap: Map<string, string>;
@@ -610,7 +747,9 @@ async function buildCSPInputForDrive(driveId: string): Promise<{
     throw new Error('Placement drive not found.');
   }
 
-  const [candUsers, candProfiles, intUsers, intProfiles, availabilities, rooms, otherSessions] =
+  const preserveSelfBooked = options.preserveSelfBooked ?? true;
+
+  const [candUsers, candProfiles, intUsers, intProfiles, availabilities, rooms, lockedSessions] =
     await Promise.all([
       UserModel.find({ role: 'CANDIDATE' }),
       CandidateProfileModel.find(),
@@ -619,8 +758,13 @@ async function buildCSPInputForDrive(driveId: string): Promise<{
       AvailabilityModel.find(),
       RoomModel.find({ isActive: true }),
       InterviewSessionModel.find({
-        driveId: { $ne: driveId },
-        status: 'Scheduled',
+        $or: [
+          { driveId: { $ne: driveId }, status: { $in: ['Scheduled', 'Completed'] } },
+          { driveId, status: 'Completed' },
+          ...(preserveSelfBooked
+            ? [{ driveId, status: 'Scheduled', bookedVia: 'CANDIDATE_SELF_BOOKING' }]
+            : []),
+        ],
       }),
     ]);
 
@@ -635,20 +779,41 @@ async function buildCSPInputForDrive(driveId: string): Promise<{
   const candProfMap = new Map(candProfiles.map((p) => [String(p.userId), p]));
   const intProfMap = new Map(intProfiles.map((p) => [String(p.userId), p]));
 
+  const lockedCurrentDriveRoundKeys = new Set(
+    lockedSessions
+      .filter((s) => s.driveId === String(drive._id))
+      .map((s) => `${s.candidateId}::${s.roundId}`)
+  );
+
   const candidates = candUsers
     .filter((u) => drive.eligibleCandidateIds.includes(String(u._id)))
     .map((u) => {
       const prof = candProfMap.get(String(u._id));
+      const completed = new Set<string>(prof?.completedRoundIds ?? []);
+      // Treat already self-booked or completed sessions in this drive as satisfied for prerequisite checks
+      for (const s of lockedSessions) {
+        if (s.driveId === String(drive._id) && s.candidateId === String(u._id)) {
+          completed.add(s.roundId);
+        }
+      }
       return {
         id: String(u._id),
         name: u.name,
         availableWindows: availMap.get(String(u._id)) ?? [],
-        completedRoundIds: prof?.completedRoundIds ?? [],
-        eligibleDriveIds: prof?.eligibleDriveIds ?? [String(drive._id)],
+        completedRoundIds: Array.from(completed),
+        eligibleDriveIds:
+          prof?.eligibleDriveIds && prof.eligibleDriveIds.length > 0
+            ? Array.from(new Set([...prof.eligibleDriveIds, String(drive._id)]))
+            : [String(drive._id)],
       };
     });
 
-  const interviewers = intUsers.map((u) => {
+  const filteredIntUsers =
+    drive.assignedInterviewerIds && drive.assignedInterviewerIds.length > 0
+      ? intUsers.filter((u) => drive.assignedInterviewerIds.includes(String(u._id)))
+      : intUsers;
+
+  const interviewers = filteredIntUsers.map((u) => {
     const prof = intProfMap.get(String(u._id));
     return {
       id: String(u._id),
@@ -673,6 +838,8 @@ async function buildCSPInputForDrive(driveId: string): Promise<{
   for (const cand of candidates) {
     for (const round of sortedRounds) {
       if (cand.completedRoundIds.includes(round.roundId)) continue;
+      if (lockedCurrentDriveRoundKeys.has(`${cand.id}::${round.roundId}`)) continue;
+
       variables.push({
         id: `var_${drive._id}_${cand.id}_${round.roundId}`,
         driveId: String(drive._id),
@@ -691,12 +858,15 @@ async function buildCSPInputForDrive(driveId: string): Promise<{
     }
   }
 
-  const existingReservations = otherSessions.map((s) => ({
+  const existingReservations = lockedSessions.map((s) => ({
     sessionId: s.variableId,
     candidateId: s.candidateId,
     interviewerIds: s.interviewerIds,
     roomId: s.roomId,
     window: { startMs: s.startMs, endMs: s.effectiveEndMs },
+    driveId: s.driveId,
+    roundId: s.roundId,
+    roundOrder: s.roundOrder,
   }));
 
   return {
@@ -719,152 +889,156 @@ apiRouter.post(
   '/schedules/generate/:driveId',
   authenticate,
   requireRole('ADMIN'),
-  async (req: Request, res: Response) => {
-    try {
-      const { driveId } = req.params;
-      const { problemInput, userMap, roomNameMap, driveTitle, companyName } =
-        await buildCSPInputForDrive(driveId);
+  asyncHandler(async (req: Request, res: Response) => {
+    const { driveId } = req.params;
+    const { problemInput, userMap, roomNameMap, driveTitle, companyName } =
+      await buildCSPInputForDrive(driveId, { preserveSelfBooked: true });
 
-      const solverResult = solver.solve(problemInput);
-      const validationReport = validator.validate(problemInput, solverResult.assignments);
+    const solverResult = solver.solve(problemInput);
+    const validationReport = validator.validate(problemInput, solverResult.assignments);
 
-      await InterviewSessionModel.deleteMany({ driveId, status: 'Scheduled' });
+    // Preserve candidate self-booked sessions while replacing unbooked/CSP-generated Scheduled sessions
+    await InterviewSessionModel.deleteMany({
+      driveId,
+      status: 'Scheduled',
+      bookedVia: { $ne: 'CANDIDATE_SELF_BOOKING' },
+    });
 
-      const sessionDocs = solverResult.assignments.map((a) => ({
-        variableId: a.variableId,
-        driveId: a.driveId,
-        driveTitle,
-        companyName,
-        roundId: a.roundId,
-        roundName: a.roundName ?? a.roundId,
-        roundOrder:
-          problemInput.variables.find((v) => v.id === a.variableId)?.roundOrder ?? 1,
-        candidateId: a.candidateId,
-        candidateName: userMap.get(a.candidateId) ?? a.candidateId,
-        interviewerIds: a.interviewerIds,
-        interviewerNames: a.interviewerIds.map((id) => userMap.get(id) ?? id),
-        roomId: a.roomId,
-        roomName: roomNameMap.get(a.roomId) ?? a.roomId,
-        startMs: a.startMs,
-        endMs: a.endMs,
-        effectiveEndMs: a.effectiveEndMs,
-        status: 'Scheduled' as const,
-        isPublished: false,
-        bookedVia: 'CSP_ENGINE' as const,
-      }));
+    const sessionDocs = solverResult.assignments.map((a) => ({
+      variableId: a.variableId,
+      driveId: a.driveId,
+      driveTitle,
+      companyName,
+      roundId: a.roundId,
+      roundName: a.roundName ?? a.roundId,
+      roundOrder:
+        problemInput.variables.find((v) => v.id === a.variableId)?.roundOrder ?? 1,
+      candidateId: a.candidateId,
+      candidateName: userMap.get(a.candidateId) ?? a.candidateId,
+      interviewerIds: a.interviewerIds,
+      interviewerNames: a.interviewerIds.map((id) => userMap.get(id) ?? id),
+      roomId: a.roomId,
+      roomName: roomNameMap.get(a.roomId) ?? a.roomId,
+      startMs: a.startMs,
+      endMs: a.endMs,
+      effectiveEndMs: a.effectiveEndMs,
+      status: 'Scheduled' as const,
+      isPublished: false,
+      bookedVia: 'CSP_ENGINE' as const,
+    }));
 
-      if (sessionDocs.length > 0) {
-        await InterviewSessionModel.insertMany(sessionDocs);
-      }
-
-      const nextStatus = validationReport.isValid ? 'Under Review' : 'Generated';
-      await PlacementDriveModel.findByIdAndUpdate(driveId, { status: nextStatus });
-
-      const scheduleVersion = await ScheduleVersionModel.create({
-        driveId,
-        status: nextStatus,
-        solverStatus: solverResult.status,
-        isCompleteSolution: solverResult.isCompleteSolution,
-        assignmentsCount: solverResult.assignments.length,
-        unscheduledDiagnostics: solverResult.unscheduled,
-        validationReport,
-        statistics: solverResult.statistics,
-        createdBy: req.user!.name,
-      });
-
-      const nlSummary = await generateNaturalLanguageScheduleSummary(
-        driveTitle,
-        solverResult,
-        validationReport
-      );
-
-      await AuditLogModel.create({
-        actorName: req.user!.name,
-        actorRole: 'ADMIN',
-        action: 'CSP_SCHEDULE_GENERATED',
-        details: nlSummary,
-      });
-
-      res.json({
-        solverResult,
-        validationReport,
-        scheduleVersion,
-        nlSummary,
-        sessions: sessionDocs,
-      });
-    } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+    if (sessionDocs.length > 0) {
+      await InterviewSessionModel.insertMany(sessionDocs);
     }
-  }
+
+    const nextStatus = validationReport.isValid ? 'Under Review' : 'Generated';
+    await PlacementDriveModel.findByIdAndUpdate(driveId, { status: nextStatus });
+
+    const scheduleVersion = await ScheduleVersionModel.create({
+      driveId,
+      status: nextStatus,
+      solverStatus: solverResult.status,
+      isCompleteSolution: solverResult.isCompleteSolution,
+      assignmentsCount: solverResult.assignments.length,
+      unscheduledDiagnostics: solverResult.unscheduled,
+      validationReport,
+      statistics: solverResult.statistics,
+      createdBy: req.user!.name,
+    });
+
+    const nlSummary = await generateNaturalLanguageScheduleSummary(
+      driveTitle,
+      solverResult,
+      validationReport
+    );
+
+    await AuditLogModel.create({
+      actorName: req.user!.name,
+      actorRole: 'ADMIN',
+      action: 'CSP_SCHEDULE_GENERATED',
+      details: nlSummary,
+    });
+
+    const allDriveSessions = await InterviewSessionModel.find({
+      driveId,
+      status: 'Scheduled',
+    }).sort({ startMs: 1 });
+
+    res.json({
+      solverResult,
+      validationReport,
+      scheduleVersion,
+      nlSummary,
+      sessions: allDriveSessions,
+    });
+  })
 );
 
 apiRouter.post(
   '/schedules/publish/:driveId',
   authenticate,
   requireRole('ADMIN'),
-  async (req: Request, res: Response) => {
-    try {
-      const { driveId } = req.params;
-      const { problemInput, driveTitle } = await buildCSPInputForDrive(driveId);
-      const currentSessions = await InterviewSessionModel.find({
-        driveId,
-        status: 'Scheduled',
-      });
+  asyncHandler(async (req: Request, res: Response) => {
+    const { driveId } = req.params;
+    const { problemInput, driveTitle } = await buildCSPInputForDrive(driveId, {
+      preserveSelfBooked: false,
+    });
+    const currentSessions = await InterviewSessionModel.find({
+      driveId,
+      status: 'Scheduled',
+    });
 
-      if (currentSessions.length === 0) {
-        res.status(400).json({ error: 'No scheduled sessions exist to publish for this drive.' });
-        return;
-      }
+    if (currentSessions.length === 0) {
+      res.status(400).json({ error: 'No scheduled sessions exist to publish for this drive.' });
+      return;
+    }
 
-      const assignments: CandidateSlotAssignment[] = currentSessions.map((s) => ({
-        variableId: s.variableId,
-        driveId: s.driveId,
-        roundId: s.roundId,
-        roundName: s.roundName,
-        candidateId: s.candidateId,
-        interviewerIds: s.interviewerIds,
-        roomId: s.roomId,
-        startMs: s.startMs,
-        endMs: s.endMs,
-        effectiveEndMs: s.effectiveEndMs,
-      }));
+    const assignments: CandidateSlotAssignment[] = currentSessions.map((s) => ({
+      variableId: s.variableId,
+      driveId: s.driveId,
+      roundId: s.roundId,
+      roundName: s.roundName,
+      candidateId: s.candidateId,
+      interviewerIds: s.interviewerIds,
+      roomId: s.roomId,
+      startMs: s.startMs,
+      endMs: s.endMs,
+      effectiveEndMs: s.effectiveEndMs,
+    }));
 
-      const validationReport = validator.validate(problemInput, assignments);
-      if (!validationReport.isValid) {
-        res.status(422).json({
-          error: 'Publication blocked: Schedule contains hard-constraint violations.',
-          validationReport,
-        });
-        return;
-      }
-
-      await InterviewSessionModel.updateMany(
-        { driveId, status: 'Scheduled' },
-        { $set: { isPublished: true } }
-      );
-
-      const drive = await PlacementDriveModel.findByIdAndUpdate(
-        driveId,
-        { status: 'Published' },
-        { new: true }
-      );
-
-      await AuditLogModel.create({
-        actorName: req.user!.name,
-        actorRole: 'ADMIN',
-        action: 'SCHEDULE_PUBLISHED',
-        details: `Published ${currentSessions.length} validated interview sessions for "${driveTitle}".`,
-      });
-
-      res.json({
-        message: `Published ${currentSessions.length} conflict-free interviews for ${driveTitle}.`,
-        drive,
+    const validationReport = validator.validate(problemInput, assignments);
+    if (!validationReport.isValid) {
+      res.status(422).json({
+        error: 'Publication blocked: Schedule contains hard-constraint violations.',
         validationReport,
       });
-    } catch (err) {
-      res.status(500).json({ error: (err as Error).message });
+      return;
     }
-  }
+
+    await InterviewSessionModel.updateMany(
+      { driveId, status: 'Scheduled' },
+      { $set: { isPublished: true } }
+    );
+
+    const drive = await PlacementDriveModel.findByIdAndUpdate(
+      driveId,
+      { status: 'Published' },
+      { new: true }
+    );
+
+    await AuditLogModel.create({
+      actorName: req.user!.name,
+      actorRole: 'ADMIN',
+      action: 'SCHEDULE_PUBLISHED',
+      details: `Published ${currentSessions.length} validated interview sessions for "${driveTitle}".`,
+    });
+
+    res.json({
+      message: `Published ${currentSessions.length} conflict-free interviews for ${driveTitle}.`,
+      drive,
+      validationReport,
+    });
+  })
 );
 
 // ============================================================================
@@ -875,7 +1049,7 @@ apiRouter.get(
   '/candidate/self-booking/options/:driveId',
   authenticate,
   requireRole('CANDIDATE'),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const { driveId } = req.params;
     const candidateId = req.user!.userId;
 
@@ -890,34 +1064,91 @@ apiRouter.get(
       return;
     }
 
-    const { problemInput, userMap, roomNameMap } = await buildCSPInputForDrive(driveId);
-    const candidateVars = problemInput.variables.filter((v) => v.candidateId === candidateId);
+    const { problemInput, userMap, roomNameMap } = await buildCSPInputForDrive(driveId, {
+      preserveSelfBooked: false,
+    });
 
-    const activeSessions = await InterviewSessionModel.find({ status: 'Scheduled' });
+    const existingCandidateDriveSessions = await InterviewSessionModel.find({
+      driveId,
+      candidateId,
+      status: { $in: ['Scheduled', 'Completed'] },
+    }).sort({ roundOrder: 1 });
+
+    // Only allow self-booking for rounds that are not already Completed or Scheduled by the candidate
+    const bookedOrCompletedRoundIds = new Set(
+      existingCandidateDriveSessions
+        .filter((s) => s.status === 'Completed' || s.bookedVia === 'CANDIDATE_SELF_BOOKING')
+        .map((s) => s.roundId)
+    );
+
+    const candidateVars = problemInput.variables.filter(
+      (v) => v.candidateId === candidateId && !bookedOrCompletedRoundIds.has(v.roundId)
+    );
+
+    if (candidateVars.length === 0) {
+      res.json({
+        recommendedSlots: [],
+        unscheduled: [],
+        alreadyBookedSessions: existingCandidateDriveSessions,
+      });
+      return;
+    }
+
+    const targetVar = candidateVars[0];
+
+    // Lock all other active sessions except the candidate's own unbooked draft for this specific variable
+    const activeSessions = await InterviewSessionModel.find({
+      status: 'Scheduled',
+      variableId: { $ne: targetVar.id },
+    });
+
     const existingReservations = activeSessions.map((s) => ({
       sessionId: s.variableId,
       candidateId: s.candidateId,
       interviewerIds: s.interviewerIds,
       roomId: s.roomId,
       window: { startMs: s.startMs, endMs: s.effectiveEndMs },
+      driveId: s.driveId,
+      roundId: s.roundId,
+      roundOrder: s.roundOrder,
     }));
+
+    // Enforce that if an earlier round is already scheduled, the next round must start >= earlier round endMs
+    let minAllowedStartMs = -Infinity;
+    for (const prev of existingCandidateDriveSessions) {
+      if (prev.roundId === targetVar.prerequisiteRoundId || prev.roundOrder < targetVar.roundOrder) {
+        minAllowedStartMs = Math.max(minAllowedStartMs, prev.endMs);
+      }
+    }
+
+    const boundedTargetVar: InterviewVariable = {
+      ...targetVar,
+      allowedTimeWindows: targetVar.allowedTimeWindows
+        .map((w) => ({
+          startMs: Math.max(w.startMs, minAllowedStartMs),
+          endMs: w.endMs,
+        }))
+        .filter((w) => w.endMs > w.startMs),
+    };
 
     const singleCandidateProblem: CSPProblemInput = {
       ...problemInput,
-      variables: candidateVars.slice(0, 1),
+      variables: [boundedTargetVar],
       existingReservations,
     };
 
-    const result = solver.solve(singleCandidateProblem);
+    const { options, unscheduled } = solver.enumerateFeasibleSlots(singleCandidateProblem, 12);
+
     res.json({
-      recommendedSlots: result.assignments.map((a) => ({
+      recommendedSlots: options.map((a) => ({
         ...a,
         interviewerNames: a.interviewerIds.map((id) => userMap.get(id) ?? id),
         roomName: roomNameMap.get(a.roomId) ?? a.roomId,
       })),
-      unscheduled: result.unscheduled,
+      unscheduled,
+      alreadyBookedSessions: existingCandidateDriveSessions,
     });
-  }
+  })
 );
 
 const selfBookRequestSchema = z.object({
@@ -932,7 +1163,7 @@ apiRouter.post(
   '/candidate/self-book',
   authenticate,
   requireRole('CANDIDATE'),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const parsed = selfBookRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid booking request.', details: parsed.error.issues });
@@ -942,73 +1173,143 @@ apiRouter.post(
     const { driveId, roundId, roomId, interviewerIds, startMs } = parsed.data;
     const candidateId = req.user!.userId;
 
-    const drive = await PlacementDriveModel.findById(driveId);
-    if (!drive || !drive.selfBookingEnabled) {
-      res.status(400).json({ error: 'Self-booking is disabled for this drive.' });
-      return;
-    }
-
-    if (!drive.eligibleCandidateIds.includes(candidateId)) {
-      res.status(403).json({ error: 'You are not eligible for this placement drive.' });
-      return;
-    }
-
-    const round = drive.rounds.find((r) => r.roundId === roundId);
-    if (!round) {
-      res.status(404).json({ error: 'Interview round not found.' });
-      return;
-    }
-
-    const endMs = startMs + round.durationMinutes * 60 * 1000;
-    const effectiveEndMs = startMs + (round.durationMinutes + round.bufferMinutes) * 60 * 1000;
-
-    const overlappingSession = await InterviewSessionModel.findOne({
-      status: 'Scheduled',
-      startMs: { $lt: effectiveEndMs },
-      effectiveEndMs: { $gt: startMs },
-      $or: [
-        { roomId },
-        { candidateId },
-        { interviewerIds: { $in: interviewerIds } },
-      ],
-    });
-
-    if (overlappingSession) {
-      res.status(409).json({
-        error:
-          'Slot conflict detected: This room, interviewer, or candidate slot was just reserved by another concurrent request.',
-      });
-      return;
-    }
-
-    const [candAvail, intAvails, roomDoc, intUsers] = await Promise.all([
-      AvailabilityModel.findOne({ userId: candidateId }),
-      AvailabilityModel.find({ userId: { $in: interviewerIds } }),
-      RoomModel.findById(roomId),
-      UserModel.find({ _id: { $in: interviewerIds } }),
-    ]);
-
-    if (!candAvail || !isContainedInAny(startMs, endMs, candAvail.windows)) {
-      res.status(422).json({ error: 'Requested slot is outside your submitted availability windows.' });
-      return;
-    }
-
-    if (!roomDoc || !isContainedInAny(startMs, effectiveEndMs, roomDoc.availableWindows)) {
-      res.status(422).json({ error: 'Selected room is not available during the requested interval.' });
-      return;
-    }
-
-    for (const intId of interviewerIds) {
-      const ia = intAvails.find((a) => String(a.userId) === intId);
-      if (!ia || !isContainedInAny(startMs, effectiveEndMs, ia.windows)) {
-        res.status(422).json({ error: 'Selected interviewer is not available during this slot.' });
+    await withSelfBookingLock(async () => {
+      const drive = await PlacementDriveModel.findById(driveId);
+      if (!drive || !drive.selfBookingEnabled) {
+        res.status(400).json({ error: 'Self-booking is disabled for this drive.' });
         return;
       }
-    }
 
-    const variableId = `var_${driveId}_${candidateId}_${roundId}`;
+      if (!drive.eligibleCandidateIds.includes(candidateId)) {
+        res.status(403).json({ error: 'You are not eligible for this placement drive.' });
+        return;
+      }
 
-    try {
+      const round = drive.rounds.find((r) => r.roundId === roundId);
+      if (!round) {
+        res.status(404).json({ error: 'Interview round not found.' });
+        return;
+      }
+
+      if (interviewerIds.length !== round.panelSize) {
+        res.status(422).json({
+          error: `Round "${round.name}" requires a panel of ${round.panelSize} interviewer(s).`,
+        });
+        return;
+      }
+
+      const endMs = startMs + round.durationMinutes * 60 * 1000;
+      const effectiveEndMs = startMs + (round.durationMinutes + round.bufferMinutes) * 60 * 1000;
+
+      if (!isContainedInAny(startMs, endMs, drive.allowedTimeWindows)) {
+        res.status(422).json({ error: 'Requested slot is outside the drive time windows.' });
+        return;
+      }
+
+      const variableId = `var_${driveId}_${candidateId}_${roundId}`;
+
+      const overlappingSession = await InterviewSessionModel.findOne({
+        variableId: { $ne: variableId },
+        status: 'Scheduled',
+        startMs: { $lt: effectiveEndMs },
+        effectiveEndMs: { $gt: startMs },
+        $or: [
+          { roomId },
+          { candidateId },
+          { interviewerIds: { $in: interviewerIds } },
+        ],
+      });
+
+      if (overlappingSession) {
+        res.status(409).json({
+          error:
+            'Slot conflict detected: This room, interviewer, or candidate slot was just reserved by another concurrent request.',
+        });
+        return;
+      }
+
+      const [candAvail, candProfile, intAvails, intProfiles, roomDoc, intUsers] = await Promise.all([
+        AvailabilityModel.findOne({ userId: candidateId }),
+        CandidateProfileModel.findOne({ userId: candidateId }),
+        AvailabilityModel.find({ userId: { $in: interviewerIds } }),
+        InterviewerProfileModel.find({ userId: { $in: interviewerIds } }),
+        RoomModel.findById(roomId),
+        UserModel.find({ _id: { $in: interviewerIds } }),
+      ]);
+
+      if (!candAvail || !isContainedInAny(startMs, endMs, candAvail.windows)) {
+        res.status(422).json({ error: 'Requested slot is outside your submitted availability windows.' });
+        return;
+      }
+
+      if (round.prerequisiteRoundId) {
+        const completedPrereq = candProfile?.completedRoundIds.includes(round.prerequisiteRoundId);
+        const scheduledPrereq = await InterviewSessionModel.findOne({
+          driveId,
+          candidateId,
+          roundId: round.prerequisiteRoundId,
+          status: { $in: ['Scheduled', 'Completed'] },
+        });
+        if (!completedPrereq && !scheduledPrereq) {
+          res.status(422).json({
+            error: `Prerequisite round "${round.prerequisiteRoundId}" must be scheduled or completed first.`,
+          });
+          return;
+        }
+        if (scheduledPrereq && scheduledPrereq.endMs > startMs) {
+          res.status(422).json({
+            error: `This round cannot start before prerequisite round "${scheduledPrereq.roundName}" ends.`,
+          });
+          return;
+        }
+      }
+
+      if (!roomDoc || !isContainedInAny(startMs, effectiveEndMs, roomDoc.availableWindows)) {
+        res.status(422).json({ error: 'Selected room is not available during the requested interval.' });
+        return;
+      }
+
+      if (roomDoc.capacity < round.requiredRoomCapacity) {
+        res.status(422).json({ error: 'Selected room does not meet minimum capacity requirements.' });
+        return;
+      }
+
+      const dayStartMs = new Date(new Date(startMs).toISOString().slice(0, 10) + 'T00:00:00.000Z').getTime();
+      const dayEndMs = dayStartMs + 24 * 60 * 60 * 1000;
+
+      for (const intId of interviewerIds) {
+        const ia = intAvails.find((a) => String(a.userId) === intId);
+        if (!ia || !isContainedInAny(startMs, effectiveEndMs, ia.windows)) {
+          res.status(422).json({ error: 'Selected interviewer is not available during this slot.' });
+          return;
+        }
+
+        const ip = intProfiles.find((p) => String(p.userId) === intId);
+        const hasSkills = round.requiredSkills.every((reqSkill) =>
+          (ip?.skills ?? []).some((s) => s.toLowerCase() === reqSkill.toLowerCase())
+        );
+        if (!hasSkills) {
+          res.status(422).json({
+            error: `Selected interviewer lacks required skills [${round.requiredSkills.join(', ')}].`,
+          });
+          return;
+        }
+
+        const dailyCap = ip?.maxInterviewsPerDay ?? 6;
+        const countOnDay = await InterviewSessionModel.countDocuments({
+          variableId: { $ne: variableId },
+          status: 'Scheduled',
+          interviewerIds: intId,
+          startMs: { $gte: dayStartMs, $lt: dayEndMs },
+        });
+        if (countOnDay + 1 > dailyCap) {
+          res.status(422).json({
+            error: 'Selected interviewer has reached their maximum daily interview limit.',
+          });
+          return;
+        }
+      }
+
       const session = await InterviewSessionModel.findOneAndUpdate(
         {
           variableId,
@@ -1048,13 +1349,8 @@ apiRouter.post(
       });
 
       res.status(201).json({ message: 'Interview slot confirmed.', session });
-    } catch (err) {
-      res.status(409).json({
-        error: 'Concurrent booking race prevented. Please refresh and choose an available slot.',
-        details: (err as Error).message,
-      });
-    }
-  }
+    });
+  })
 );
 
 // ============================================================================
@@ -1069,7 +1365,7 @@ apiRouter.post(
   '/sessions/:sessionId/cancel-and-repair',
   authenticate,
   requireRole('INTERVIEWER', 'ADMIN'),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const parsed = cancelSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Please provide a cancellation reason.' });
@@ -1093,7 +1389,32 @@ apiRouter.post(
     const droppedInterviewerId =
       req.user!.role === 'INTERVIEWER' ? req.user!.userId : session.interviewerIds[0];
 
-    const { problemInput, userMap, roomNameMap } = await buildCSPInputForDrive(session.driveId);
+    const cancelledStartMs = session.startMs;
+    const cancelledEffectiveEndMs = session.effectiveEndMs;
+
+    // Persist the sliced availability window into MongoDB so future solver runs know the interviewer is unavailable then
+    const droppedAvailDoc = await AvailabilityModel.findOne({ userId: droppedInterviewerId });
+    if (droppedAvailDoc) {
+      const slicedWindows = droppedAvailDoc.windows.flatMap((w) => {
+        if (w.endMs <= cancelledStartMs || w.startMs >= cancelledEffectiveEndMs) {
+          return [{ startMs: w.startMs, endMs: w.endMs }];
+        }
+        const parts: TimeWindow[] = [];
+        if (w.startMs < cancelledStartMs) {
+          parts.push({ startMs: w.startMs, endMs: cancelledStartMs });
+        }
+        if (w.endMs > cancelledEffectiveEndMs) {
+          parts.push({ startMs: cancelledEffectiveEndMs, endMs: w.endMs });
+        }
+        return parts;
+      });
+      droppedAvailDoc.windows = slicedWindows;
+      await droppedAvailDoc.save();
+    }
+
+    const { problemInput, userMap, roomNameMap } = await buildCSPInputForDrive(session.driveId, {
+      preserveSelfBooked: false,
+    });
     const variable = problemInput.variables.find((v) => v.id === session.variableId);
 
     const otherDriveSessions = await InterviewSessionModel.find({
@@ -1188,7 +1509,7 @@ apiRouter.post(
     session.cancellationReason = parsed.data.reason;
     await session.save();
     res.json({ repaired: false, session });
-  }
+  })
 );
 
 // ============================================================================
@@ -1209,7 +1530,7 @@ apiRouter.post(
   '/feedback',
   authenticate,
   requireRole('INTERVIEWER'),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const parsed = feedbackSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: 'Invalid feedback rubric scores.', details: parsed.error.issues });
@@ -1301,18 +1622,18 @@ apiRouter.post(
       feedback,
       nextStageLabel,
     });
-  }
+  })
 );
 
 // ============================================================================
-// 9. ROLE-SPECIFIC DASHBOARD DATA & .ICS EXPORT
+// 9. ROLE-SPECIFIC DASHBOARD DATA & RFC 5545 .ICS EXPORT
 // ============================================================================
 
 apiRouter.get(
   '/interviewer/dashboard',
   authenticate,
   requireRole('INTERVIEWER'),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const interviewerId = req.user!.userId;
     const [sessions, feedbacks, profile, availability, drives] = await Promise.all([
       InterviewSessionModel.find({ interviewerIds: interviewerId }).sort({ startMs: 1 }),
@@ -1329,14 +1650,14 @@ apiRouter.get(
       availability: availability?.windows ?? [],
       drives,
     });
-  }
+  })
 );
 
 apiRouter.get(
   '/candidate/dashboard',
   authenticate,
   requireRole('CANDIDATE'),
-  async (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const candidateId = req.user!.userId;
     const [sessions, profile, availability, drives] = await Promise.all([
       InterviewSessionModel.find({
@@ -1354,6 +1675,42 @@ apiRouter.get(
       availability: availability?.windows ?? [],
       drives,
     });
-  }
+  })
 );
 
+apiRouter.get(
+  '/schedules/ics',
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const requester = req.user!;
+    const driveId = typeof req.query.driveId === 'string' ? req.query.driveId : undefined;
+
+    let filter: Record<string, unknown> = { status: { $ne: 'Cancelled' } };
+    if (driveId) {
+      filter.driveId = driveId;
+    }
+
+    if (requester.role === 'INTERVIEWER') {
+      filter.interviewerIds = requester.userId;
+    } else if (requester.role === 'CANDIDATE') {
+      filter = {
+        ...filter,
+        candidateId: requester.userId,
+        $or: [{ isPublished: true }, { bookedVia: 'CANDIDATE_SELF_BOOKING' }],
+      };
+    }
+
+    const sessions = await InterviewSessionModel.find(filter).sort({ startMs: 1 });
+    const icsContent = generateICSFeed(
+      sessions,
+      `Timora Schedule (${requester.name})`
+    );
+
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="timora_schedule_${requester.role.toLowerCase()}.ics"`
+    );
+    res.send(icsContent);
+  })
+);

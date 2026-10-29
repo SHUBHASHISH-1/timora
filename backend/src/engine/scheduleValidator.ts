@@ -29,6 +29,16 @@ export class IndependentScheduleValidator {
     const roomMap = new Map(problem.rooms.map((r) => [r.id, r]));
     const assignmentByCandidateRound = new Map<string, CandidateSlotAssignment>();
 
+    // Track daily interviewer workload starting from existingReservations
+    const interviewerDayCounts = new Map<string, number>();
+    for (const existing of problem.existingReservations) {
+      const dayKey = new Date(existing.window.startMs).toISOString().slice(0, 10);
+      for (const intId of existing.interviewerIds) {
+        const key = `${intId}::${dayKey}`;
+        interviewerDayCounts.set(key, (interviewerDayCounts.get(key) ?? 0) + 1);
+      }
+    }
+
     for (const a of assignments) {
       assignmentByCandidateRound.set(`${a.candidateId}::${a.roundId}`, a);
     }
@@ -77,7 +87,13 @@ export class IndependentScheduleValidator {
         const scheduledPrereq = assignmentByCandidateRound.get(
           `${a.candidateId}::${variable.prerequisiteRoundId}`
         );
-        if (!completedPreviously && !scheduledPrereq) {
+        const existingPrereq = problem.existingReservations.find(
+          (res) =>
+            res.candidateId === a.candidateId &&
+            res.roundId === variable.prerequisiteRoundId &&
+            (!res.driveId || res.driveId === a.driveId)
+        );
+        if (!completedPreviously && !scheduledPrereq && !existingPrereq) {
           violations.push({
             code: 'ROUND_DEPENDENCY_VIOLATION',
             variableId: a.variableId,
@@ -101,6 +117,7 @@ export class IndependentScheduleValidator {
         });
       }
 
+      const dayKey = new Date(a.startMs).toISOString().slice(0, 10);
       for (const intId of a.interviewerIds) {
         const interviewer = intMap.get(intId);
         if (!interviewer) {
@@ -128,6 +145,20 @@ export class IndependentScheduleValidator {
             code: 'SKILL_MISMATCH',
             variableId: a.variableId,
             message: `Interviewer ${interviewer.name} lacks required skills [${variable.requiredSkills.join(', ')}].`,
+          });
+        }
+
+        const dayCountKey = `${intId}::${dayKey}`;
+        const nextCount = (interviewerDayCounts.get(dayCountKey) ?? 0) + 1;
+        interviewerDayCounts.set(dayCountKey, nextCount);
+        if (
+          interviewer.maxInterviewsPerDay !== undefined &&
+          nextCount > interviewer.maxInterviewsPerDay
+        ) {
+          violations.push({
+            code: 'INTERVIEWER_DAILY_CAP_EXCEEDED',
+            variableId: a.variableId,
+            message: `Interviewer ${interviewer.name} exceeds daily cap (${interviewer.maxInterviewsPerDay}) on ${dayKey}.`,
           });
         }
       }
@@ -210,13 +241,35 @@ export class IndependentScheduleValidator {
         const a = assignments[i];
         const b = assignments[j];
 
-        if (a.candidateId === b.candidateId && overlaps(a.startMs, a.endMs, b.startMs, b.endMs)) {
-          violations.push({
-            code: 'CANDIDATE_OVERLAP',
-            variableId: a.variableId,
-            conflictingVariableId: b.variableId,
-            message: `Candidate ${a.candidateId} is double-booked in ${a.variableId} and ${b.variableId}.`,
-          });
+        if (a.candidateId === b.candidateId) {
+          if (overlaps(a.startMs, a.endMs, b.startMs, b.endMs)) {
+            violations.push({
+              code: 'CANDIDATE_OVERLAP',
+              variableId: a.variableId,
+              conflictingVariableId: b.variableId,
+              message: `Candidate ${a.candidateId} is double-booked in ${a.variableId} and ${b.variableId}.`,
+            });
+          }
+
+          const varA = varMap.get(a.variableId);
+          const varB = varMap.get(b.variableId);
+          if (varA && varB && varA.driveId === varB.driveId && varA.roundOrder !== varB.roundOrder) {
+            if (varA.roundOrder < varB.roundOrder && a.endMs > b.startMs) {
+              violations.push({
+                code: 'ROUND_DEPENDENCY_VIOLATION',
+                variableId: b.variableId,
+                conflictingVariableId: a.variableId,
+                message: `Round ${b.roundId} starts before earlier round ${a.roundId} finishes.`,
+              });
+            } else if (varB.roundOrder < varA.roundOrder && b.endMs > a.startMs) {
+              violations.push({
+                code: 'ROUND_DEPENDENCY_VIOLATION',
+                variableId: a.variableId,
+                conflictingVariableId: b.variableId,
+                message: `Round ${a.roundId} starts before earlier round ${b.roundId} finishes.`,
+              });
+            }
+          }
         }
 
         if (
@@ -254,4 +307,3 @@ export class IndependentScheduleValidator {
     };
   }
 }
-

@@ -4,7 +4,7 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { ApplicationShell } from '@/components/ApplicationShell';
 import { ScheduleCalendar } from '@/components/ScheduleCalendar';
-import { apiFetch, API_BASE, getStoredToken } from '@/lib/api';
+import { apiFetch, downloadCandidateCV, downloadScheduleICS } from '@/lib/api';
 
 export default function AdminPortalPage() {
   const router = useRouter();
@@ -33,8 +33,9 @@ export default function AdminPortalPage() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deletingDrive, setDeletingDrive] = useState(false);
 
-  // Candidate Search & Filter State
+  // Candidate Search & Eligibility Drive Filter State
   const [candidateSearch, setCandidateSearch] = useState('');
+  const [eligibilityDriveId, setEligibilityDriveId] = useState('');
 
   // Profile Form State
   const [profileName, setProfileName] = useState('');
@@ -57,12 +58,15 @@ export default function AdminPortalPage() {
       setProfileDept(meRes.user.department || '');
       setProfilePhone(meRes.user.phone || '');
       setOverview(ovRes);
+      if (ovRes.drives?.length > 0 && !eligibilityDriveId) {
+        setEligibilityDriveId(ovRes.drives[0]._id);
+      }
     } catch (err) {
       setErrorMessage((err as Error).message);
     } finally {
       setLoading(false);
     }
-  }, [router]);
+  }, [router, eligibilityDriveId]);
 
   useEffect(() => {
     loadData();
@@ -98,8 +102,11 @@ export default function AdminPortalPage() {
     try {
       const startMs = new Date(`${newDriveDate}T09:00:00.000Z`).getTime();
       const endMs = new Date(`${newDriveDate}T17:00:00.000Z`).getTime();
+      const stamp = Date.now();
+      const r1Id = `R1_${stamp}`;
+      const r2Id = `R2_${stamp}`;
 
-      await apiFetch('/drives', {
+      const created = await apiFetch('/drives', {
         method: 'POST',
         body: JSON.stringify({
           title: newDriveTitle,
@@ -109,7 +116,7 @@ export default function AdminPortalPage() {
           allowedTimeWindows: [{ startMs, endMs }],
           rounds: [
             {
-              roundId: `R1_${Date.now()}`,
+              roundId: r1Id,
               name: 'Technical Round 1 — DSA',
               order: 1,
               durationMinutes: 45,
@@ -120,7 +127,7 @@ export default function AdminPortalPage() {
               passingScoreThreshold: 70,
             },
             {
-              roundId: `R2_${Date.now()}`,
+              roundId: r2Id,
               name: 'Technical Round 2 — System Design',
               order: 2,
               durationMinutes: 45,
@@ -128,7 +135,7 @@ export default function AdminPortalPage() {
               requiredSkills: ['System Design'],
               panelSize: 1,
               requiredRoomCapacity: 2,
-              prerequisiteRoundId: `R1_${Date.now()}`,
+              prerequisiteRoundId: r1Id,
               passingScoreThreshold: 75,
             },
           ],
@@ -138,6 +145,9 @@ export default function AdminPortalPage() {
       });
       setNewDriveTitle('');
       setNewDriveCompany('');
+      if (created?.drive?._id) {
+        setEligibilityDriveId(created.drive._id);
+      }
       setActionMessage('Placement drive created successfully.');
       await loadData();
     } catch (err) {
@@ -148,8 +158,12 @@ export default function AdminPortalPage() {
   const handleCreateRoom = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const startMs = Date.UTC(2026, 9, 28, 9, 0, 0);
-      const endMs = Date.UTC(2026, 9, 28, 17, 0, 0);
+      const defaultStartMs = Date.UTC(2026, 9, 28, 9, 0, 0);
+      const defaultEndMs = Date.UTC(2026, 9, 28, 17, 0, 0);
+      const driveWindows = (overview.drives || []).flatMap(
+        (d: any) => d.allowedTimeWindows || []
+      );
+
       await apiFetch('/rooms', {
         method: 'POST',
         body: JSON.stringify({
@@ -160,7 +174,10 @@ export default function AdminPortalPage() {
             .split(',')
             .map((s) => s.trim())
             .filter(Boolean),
-          availableWindows: [{ startMs, endMs }],
+          availableWindows: [
+            { startMs: defaultStartMs, endMs: defaultEndMs },
+            ...driveWindows,
+          ],
         }),
       });
       setNewRoomName('');
@@ -197,7 +214,11 @@ export default function AdminPortalPage() {
     }
   };
 
-  const handleToggleCandidateEligibility = async (candidateUserId: string, driveId: string, currentEligible: boolean) => {
+  const handleToggleCandidateEligibility = async (
+    candidateUserId: string,
+    driveId: string,
+    currentEligible: boolean
+  ) => {
     try {
       await apiFetch(`/admin/candidates/${candidateUserId}/eligibility`, {
         method: 'PATCH',
@@ -240,8 +261,6 @@ export default function AdminPortalPage() {
   }
 
   const scheduledSessions = overview.sessions.filter((s: any) => s.status === 'Scheduled');
-  const completedSessions = overview.sessions.filter((s: any) => s.status === 'Completed');
-  const cancelledSessions = overview.sessions.filter((s: any) => s.status === 'Cancelled');
 
   const filteredCandidates = overview.candidates.filter((c: any) => {
     const q = candidateSearch.toLowerCase();
@@ -252,6 +271,9 @@ export default function AdminPortalPage() {
       (c.profile?.skills || []).some((s: string) => s.toLowerCase().includes(q))
     );
   });
+
+  const targetEligibilityDrive =
+    overview.drives.find((d: any) => d._id === eligibilityDriveId) || overview.drives[0];
 
   return (
     <ApplicationShell
@@ -291,7 +313,13 @@ export default function AdminPortalPage() {
                 Placement Coordinator Command Center
               </p>
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => downloadScheduleICS().catch((e) => setErrorMessage(e.message))}
+                className="px-3.5 py-2 rounded-md border border-neutral-300 bg-white text-neutral-900 text-xs font-semibold hover:bg-neutral-100 transition"
+              >
+                Export Master .ICS
+              </button>
               <button
                 onClick={() => setActiveTab('Placement Drives')}
                 className="px-3.5 py-2 rounded-md border border-neutral-300 bg-white text-neutral-900 text-xs font-semibold hover:bg-neutral-100 transition"
@@ -421,6 +449,31 @@ export default function AdminPortalPage() {
               </div>
             )}
           </div>
+
+          {/* Live System Audit Activity Feed */}
+          {overview.auditLogs?.length > 0 && (
+            <div className="bg-white border border-neutral-200 rounded-lg p-5 space-y-3">
+              <div className="flex items-center justify-between border-b border-neutral-100 pb-2.5">
+                <h2 className="text-sm font-bold text-neutral-950">Recent System Audit Feed</h2>
+                <span className="text-[11px] font-mono text-neutral-500">
+                  Latest {overview.auditLogs.length} event(s)
+                </span>
+              </div>
+              <div className="divide-y divide-neutral-100 max-h-60 overflow-y-auto">
+                {overview.auditLogs.map((log: any) => (
+                  <div key={log._id} className="py-2 flex items-start justify-between gap-4 text-xs">
+                    <div>
+                      <span className="font-mono font-semibold text-neutral-900">[{log.action}]</span>{' '}
+                      <span className="text-neutral-700">{log.details}</span>
+                    </div>
+                    <span className="font-mono text-[11px] text-neutral-400 shrink-0">
+                      {new Date(log.createdAt).toISOString().slice(11, 19)} UTC
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -557,14 +610,29 @@ export default function AdminPortalPage() {
                 Inspect candidate credentials, verified skills, recruitment stage, and CV uploads
               </p>
             </div>
-            <div className="w-72">
-              <input
-                type="text"
-                placeholder="Search candidates by name, reg, skill..."
-                value={candidateSearch}
-                onChange={(e) => setCandidateSearch(e.target.value)}
-                className="w-full h-9 px-3.5 rounded border border-neutral-300 text-xs text-neutral-950 focus:border-neutral-950 focus:outline-none"
-              />
+            <div className="flex flex-wrap items-center gap-3">
+              {overview.drives.length > 0 && (
+                <select
+                  value={targetEligibilityDrive?._id || ''}
+                  onChange={(e) => setEligibilityDriveId(e.target.value)}
+                  className="h-9 px-3 rounded border border-neutral-300 text-xs bg-white text-neutral-950"
+                >
+                  {overview.drives.map((d: any) => (
+                    <option key={d._id} value={d._id}>
+                      Eligibility Drive: {d.companyName} — {d.title}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <div className="w-64">
+                <input
+                  type="text"
+                  placeholder="Search candidates by name, reg, skill..."
+                  value={candidateSearch}
+                  onChange={(e) => setCandidateSearch(e.target.value)}
+                  className="w-full h-9 px-3.5 rounded border border-neutral-300 text-xs text-neutral-950 focus:border-neutral-950 focus:outline-none"
+                />
+              </div>
             </div>
           </div>
 
@@ -582,8 +650,7 @@ export default function AdminPortalPage() {
               </thead>
               <tbody className="divide-y divide-neutral-200">
                 {filteredCandidates.map((c: any) => {
-                  const firstDrive = overview.drives[0];
-                  const isEligible = firstDrive?.eligibleCandidateIds.includes(c.userId);
+                  const isEligible = targetEligibilityDrive?.eligibleCandidateIds.includes(c.userId);
                   return (
                     <tr key={c.userId} className="hover:bg-neutral-50">
                       <td className="py-3.5 px-4">
@@ -609,9 +676,15 @@ export default function AdminPortalPage() {
                         {c.profile?.currentStage || 'Registered'}
                       </td>
                       <td className="py-3.5 px-4 font-mono">
-                        {firstDrive ? (
+                        {targetEligibilityDrive ? (
                           <button
-                            onClick={() => handleToggleCandidateEligibility(c.userId, firstDrive._id, isEligible)}
+                            onClick={() =>
+                              handleToggleCandidateEligibility(
+                                c.userId,
+                                targetEligibilityDrive._id,
+                                isEligible
+                              )
+                            }
                             className={`px-2.5 py-1 rounded text-[11px] border ${
                               isEligible
                                 ? 'bg-neutral-950 text-white border-neutral-950'
@@ -628,20 +701,9 @@ export default function AdminPortalPage() {
                         {c.profile?.cvMetadata?.storedFileName ? (
                           <button
                             type="button"
-                            onClick={async () => {
-                              try {
-                                const token = getStoredToken();
-                                const res = await fetch(`${API_BASE}/profile/cv/${c.userId}`, {
-                                  headers: token ? { Authorization: `Bearer ${token}` } : {},
-                                });
-                                if (!res.ok) throw new Error('Unable to download CV document');
-                                const blob = await res.blob();
-                                const url = URL.createObjectURL(blob);
-                                window.open(url, '_blank');
-                              } catch (e) {
-                                alert((e as Error).message);
-                              }
-                            }}
+                            onClick={() =>
+                              downloadCandidateCV(c.userId).catch((e) => setErrorMessage(e.message))
+                            }
                             className="underline font-semibold text-neutral-950 hover:text-neutral-700"
                           >
                             Download PDF
@@ -708,7 +770,9 @@ export default function AdminPortalPage() {
                           Solver Status: {ver.solverStatus} · Independent Validation:{' '}
                           <span
                             className={
-                              ver.validationReport?.isValid ? 'text-neutral-950 font-bold' : 'text-red-700 font-bold'
+                              ver.validationReport?.isValid
+                                ? 'text-neutral-950 font-bold'
+                                : 'text-red-700 font-bold'
                             }
                           >
                             {ver.validationReport?.isValid ? 'PASSED (0 Hard Violations)' : 'FAILED'}
@@ -905,7 +969,9 @@ export default function AdminPortalPage() {
                       <p className="font-mono text-[11px] text-neutral-500 font-normal">{i.email}</p>
                     </td>
                     <td className="py-3.5 px-4">
-                      <p className="font-semibold text-neutral-900">{i.profile?.company || 'Northwind Labs'}</p>
+                      <p className="font-semibold text-neutral-900">
+                        {i.profile?.company || 'Northwind Labs'}
+                      </p>
                       <div className="flex flex-wrap gap-1 mt-1">
                         {(i.profile?.skills || []).map((s: string) => (
                           <span
@@ -951,7 +1017,10 @@ export default function AdminPortalPage() {
             </p>
           </div>
 
-          <form onSubmit={handleSaveProfile} className="bg-white border border-neutral-200 rounded-lg p-6 space-y-4">
+          <form
+            onSubmit={handleSaveProfile}
+            className="bg-white border border-neutral-200 rounded-lg p-6 space-y-4"
+          >
             <div>
               <label className="block text-xs font-semibold mb-1">Full Name</label>
               <input
@@ -1013,7 +1082,8 @@ export default function AdminPortalPage() {
                   {selectedDriveModal.title}
                 </h3>
                 <p className="text-xs text-neutral-600 mt-1">
-                  Target Role: <strong>{selectedDriveModal.jobRole}</strong> · Package: <strong>{selectedDriveModal.packageLPA}</strong>
+                  Target Role: <strong>{selectedDriveModal.jobRole}</strong> · Package:{' '}
+                  <strong>{selectedDriveModal.packageLPA}</strong>
                 </p>
               </div>
               <div className="flex items-center gap-3">
@@ -1037,19 +1107,25 @@ export default function AdminPortalPage() {
             {/* Modal Details Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
               <div className="p-3 rounded border border-neutral-200 bg-neutral-50">
-                <span className="text-[10px] font-mono uppercase text-neutral-500 block">Eligible Candidates</span>
+                <span className="text-[10px] font-mono uppercase text-neutral-500 block">
+                  Eligible Candidates
+                </span>
                 <span className="text-base font-bold text-neutral-950">
                   {selectedDriveModal.eligibleCandidateIds?.length || 0} enrolled
                 </span>
               </div>
               <div className="p-3 rounded border border-neutral-200 bg-neutral-50">
-                <span className="text-[10px] font-mono uppercase text-neutral-500 block">Assigned Panel</span>
+                <span className="text-[10px] font-mono uppercase text-neutral-500 block">
+                  Assigned Panel
+                </span>
                 <span className="text-base font-bold text-neutral-950">
                   {selectedDriveModal.assignedInterviewerIds?.length || 0} interviewers
                 </span>
               </div>
               <div className="p-3 rounded border border-neutral-200 bg-neutral-50">
-                <span className="text-[10px] font-mono uppercase text-neutral-500 block">Candidate Booking</span>
+                <span className="text-[10px] font-mono uppercase text-neutral-500 block">
+                  Candidate Booking
+                </span>
                 <span className="text-base font-bold text-neutral-950">
                   {selectedDriveModal.selfBookingEnabled ? 'Self-Booking Active' : 'Coordinator-Only'}
                 </span>
@@ -1063,9 +1139,13 @@ export default function AdminPortalPage() {
               </h4>
               <div className="space-y-1">
                 {(selectedDriveModal.allowedTimeWindows || []).map((w: any, idx: number) => (
-                  <div key={idx} className="text-xs font-mono p-2 rounded bg-neutral-50 border border-neutral-200">
-                    Window #{idx + 1}: {new Date(w.startMs).toISOString().slice(0, 10)}{' '}
-                    ({new Date(w.startMs).toISOString().slice(11, 16)}–{new Date(w.endMs).toISOString().slice(11, 16)} UTC)
+                  <div
+                    key={idx}
+                    className="text-xs font-mono p-2 rounded bg-neutral-50 border border-neutral-200"
+                  >
+                    Window #{idx + 1}: {new Date(w.startMs).toISOString().slice(0, 10)} (
+                    {new Date(w.startMs).toISOString().slice(11, 16)}–
+                    {new Date(w.endMs).toISOString().slice(11, 16)} UTC)
                   </div>
                 ))}
               </div>
@@ -1175,4 +1255,3 @@ export default function AdminPortalPage() {
     </ApplicationShell>
   );
 }
-

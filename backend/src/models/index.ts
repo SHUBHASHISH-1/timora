@@ -282,6 +282,10 @@ const InterviewSessionSchema = new Schema<IInterviewSession>(
   { timestamps: true, optimisticConcurrency: true }
 );
 
+// Compound indexes for atomic interval overlap checks and drive queries
+InterviewSessionSchema.index({ status: 1, startMs: 1, effectiveEndMs: 1 });
+InterviewSessionSchema.index({ driveId: 1, candidateId: 1, roundId: 1 });
+
 export const InterviewSessionModel = mongoose.model<IInterviewSession>(
   'InterviewSession',
   InterviewSessionSchema
@@ -436,4 +440,3 @@ const AuditLogSchema = new Schema<IAuditLog>(
 );
 
 export const AuditLogModel = mongoose.model<IAuditLog>('AuditLog', AuditLogSchema);
-

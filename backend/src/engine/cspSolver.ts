@@ -56,24 +56,31 @@ function getCombinations<T>(items: T[], k: number): T[][] {
 }
 
 export class TimoraCSPSolver {
-  public solve(input: CSPProblemInput): CSPSolverResult {
-    const startClock = Date.now();
+  private buildInitialDomains(input: CSPProblemInput): {
+    initialDomains: Map<string, DomainOption[]>;
+    activeVariables: InterviewVariable[];
+    unscheduled: UnscheduledDiagnostic[];
+    existingInterviewerDayLoad: Map<string, number>;
+  } {
     const stepMs = (input.slotGranularityMinutes ?? 15) * 60 * 1000;
-    const maxNodes = input.maxSearchNodes ?? 50000;
-    const timeoutMs = input.timeoutMs ?? 10000;
-
     const candidateMap = new Map(input.candidates.map((c) => [c.id, c]));
-    const interviewerMap = new Map(input.interviewers.map((i) => [i.id, i]));
 
     const initialDomains = new Map<string, DomainOption[]>();
     const unscheduled: UnscheduledDiagnostic[] = [];
     const activeVariables: InterviewVariable[] = [];
-    const warnings: string[] = [];
 
     const baseInterviewerLoad = new Map<string, number>();
+    const existingInterviewerDayLoad = new Map<string, number>();
+
     for (const res of input.existingReservations) {
+      const dayKey = new Date(res.window.startMs).toISOString().slice(0, 10);
       for (const intId of res.interviewerIds) {
         baseInterviewerLoad.set(intId, (baseInterviewerLoad.get(intId) ?? 0) + 1);
+        const dayLoadKey = `${intId}::${dayKey}`;
+        existingInterviewerDayLoad.set(
+          dayLoadKey,
+          (existingInterviewerDayLoad.get(dayLoadKey) ?? 0) + 1
+        );
       }
     }
 
@@ -102,7 +109,13 @@ export class TimoraCSPSolver {
         const alreadyCompleted = candidate.completedRoundIds.includes(variable.prerequisiteRoundId);
         const scheduledInSameBatch =
           batchRoundsByCandidate.get(variable.candidateId)?.has(variable.prerequisiteRoundId) ?? false;
-        if (!alreadyCompleted && !scheduledInSameBatch) {
+        const scheduledInExisting = input.existingReservations.some(
+          (res) =>
+            res.candidateId === variable.candidateId &&
+            res.roundId === variable.prerequisiteRoundId &&
+            (!res.driveId || res.driveId === variable.driveId)
+        );
+        if (!alreadyCompleted && !scheduledInSameBatch && !scheduledInExisting) {
           unscheduled.push({
             variableId: variable.id,
             candidateId: variable.candidateId,
@@ -185,9 +198,14 @@ export class TimoraCSPSolver {
       for (const startMs of candidateStarts) {
         const endMs = startMs + durationMs;
         const effectiveEndMs = startMs + effectiveDurationMs;
+        const dayKey = new Date(startMs).toISOString().slice(0, 10);
 
         const availInterviewersAtSlot = qualifiedInterviewers.filter((interviewer) => {
           if (!isContainedInAny(startMs, effectiveEndMs, interviewer.availableWindows)) return false;
+          if (interviewer.maxInterviewsPerDay !== undefined) {
+            const existingOnDay = existingInterviewerDayLoad.get(`${interviewer.id}::${dayKey}`) ?? 0;
+            if (existingOnDay >= interviewer.maxInterviewsPerDay) return false;
+          }
           const hasConflict = input.existingReservations.some(
             (res) =>
               res.interviewerIds.includes(interviewer.id) &&
@@ -258,6 +276,93 @@ export class TimoraCSPSolver {
       activeVariables.push(variable);
     }
 
+    return {
+      initialDomains,
+      activeVariables,
+      unscheduled,
+      existingInterviewerDayLoad,
+    };
+  }
+
+  /**
+   * Enumerates up to `maxOptions` distinct, conflict-free slot options for candidate self-booking.
+   */
+  public enumerateFeasibleSlots(
+    input: CSPProblemInput,
+    maxOptions = 12
+  ): {
+    options: CandidateSlotAssignment[];
+    unscheduled: UnscheduledDiagnostic[];
+  } {
+    const { initialDomains, activeVariables, unscheduled } = this.buildInitialDomains(input);
+    if (activeVariables.length === 0) {
+      return { options: [], unscheduled };
+    }
+
+    const targetVar = activeVariables[0];
+    const domain = initialDomains.get(targetVar.id) ?? [];
+
+    // Sort chronologically first, then by lowest soft cost, and pick distinct start-time/room/panel combinations
+    const chronological = [...domain].sort((a, b) => {
+      if (a.startMs !== b.startMs) return a.startMs - b.startMs;
+      return a.softCost - b.softCost;
+    });
+
+    const selected: CandidateSlotAssignment[] = [];
+    const seenStartTimes = new Set<number>();
+
+    // Pass 1: One optimal room/panel option per distinct start time so the candidate gets varied time choices
+    for (const opt of chronological) {
+      if (seenStartTimes.has(opt.startMs)) continue;
+      seenStartTimes.add(opt.startMs);
+      selected.push({
+        variableId: targetVar.id,
+        driveId: targetVar.driveId,
+        roundId: targetVar.roundId,
+        roundName: targetVar.roundName,
+        candidateId: targetVar.candidateId,
+        interviewerIds: opt.interviewerIds,
+        roomId: opt.roomId,
+        startMs: opt.startMs,
+        endMs: opt.endMs,
+        effectiveEndMs: opt.effectiveEndMs,
+      });
+      if (selected.length >= maxOptions) break;
+    }
+
+    return { options: selected, unscheduled };
+  }
+
+  public solve(input: CSPProblemInput): CSPSolverResult {
+    const startClock = Date.now();
+    const maxNodes = input.maxSearchNodes ?? 50000;
+    const timeoutMs = input.timeoutMs ?? 10000;
+
+    const interviewerMap = new Map(input.interviewers.map((i) => [i.id, i]));
+    const { initialDomains, activeVariables, unscheduled, existingInterviewerDayLoad } =
+      this.buildInitialDomains(input);
+    const warnings: string[] = [];
+
+    // Ensure any variable whose prerequisite was already marked unscheduled in unary pruning is also pruned
+    for (let i = activeVariables.length - 1; i >= 0; i--) {
+      const v = activeVariables[i];
+      if (!v.prerequisiteRoundId) continue;
+      const prereqFailed = unscheduled.some(
+        (u) => u.candidateId === v.candidateId && u.roundId === v.prerequisiteRoundId
+      );
+      if (prereqFailed) {
+        activeVariables.splice(i, 1);
+        initialDomains.delete(v.id);
+        unscheduled.push({
+          variableId: v.id,
+          candidateId: v.candidateId,
+          roundId: v.roundId,
+          reasonCode: 'UNMET_ROUND_PREREQUISITE',
+          explanation: `Prerequisite round ${v.prerequisiteRoundId} could not be scheduled.`,
+        });
+      }
+    }
+
     let exploredNodes = 0;
     let backtracks = 0;
     let prunedBranches = 0;
@@ -304,12 +409,45 @@ export class TimoraCSPSolver {
       return true;
     };
 
-    const selectMRVVariable = (domains: Map<string, DomainOption[]>): InterviewVariable | null => {
+    const violatesDailyCap = (option: DomainOption): boolean => {
+      const dayKey = new Date(option.startMs).toISOString().slice(0, 10);
+      for (const intId of option.interviewerIds) {
+        const intProfile = interviewerMap.get(intId);
+        if (intProfile?.maxInterviewsPerDay !== undefined) {
+          let countOnDay = existingInterviewerDayLoad.get(`${intId}::${dayKey}`) ?? 0;
+          for (const [, assignedOpt] of currentAssignment.entries()) {
+            const assignedDay = new Date(assignedOpt.startMs).toISOString().slice(0, 10);
+            if (assignedDay === dayKey && assignedOpt.interviewerIds.includes(intId)) {
+              countOnDay++;
+            }
+          }
+          if (countOnDay + 1 > intProfile.maxInterviewsPerDay) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    const selectMRVVariable = (
+      domains: Map<string, DomainOption[]>,
+      requirePrerequisiteAssigned = false
+    ): InterviewVariable | null => {
       let bestVar: InterviewVariable | null = null;
       let minDomainSize = Infinity;
 
       for (const v of activeVariables) {
         if (currentAssignment.has(v.id)) continue;
+
+        if (requirePrerequisiteAssigned && v.prerequisiteRoundId) {
+          const prereqVar = activeVariables.find(
+            (other) => other.candidateId === v.candidateId && other.roundId === v.prerequisiteRoundId
+          );
+          if (prereqVar && !currentAssignment.has(prereqVar.id)) {
+            continue;
+          }
+        }
+
         const domSize = domains.get(v.id)?.length ?? 0;
         if (domSize < minDomainSize) {
           minDomainSize = domSize;
@@ -335,32 +473,14 @@ export class TimoraCSPSolver {
         return false;
       }
 
-      const variable = selectMRVVariable(domains);
+      const variable = selectMRVVariable(domains, false);
       if (!variable) return true;
 
       const options = domains.get(variable.id) ?? [];
       for (const option of options) {
         exploredNodes++;
 
-        const dayKey = new Date(option.startMs).toISOString().slice(0, 10);
-        let exceedsDailyCap = false;
-        for (const intId of option.interviewerIds) {
-          const intProfile = interviewerMap.get(intId);
-          if (intProfile?.maxInterviewsPerDay !== undefined) {
-            let countOnDay = 0;
-            for (const [, assignedOpt] of currentAssignment.entries()) {
-              const assignedDay = new Date(assignedOpt.startMs).toISOString().slice(0, 10);
-              if (assignedDay === dayKey && assignedOpt.interviewerIds.includes(intId)) {
-                countOnDay++;
-              }
-            }
-            if (countOnDay + 1 > intProfile.maxInterviewsPerDay) {
-              exceedsDailyCap = true;
-              break;
-            }
-          }
-        }
-        if (exceedsDailyCap) continue;
+        if (violatesDailyCap(option)) continue;
 
         currentAssignment.set(variable.id, option);
 
@@ -406,10 +526,14 @@ export class TimoraCSPSolver {
       const workingDomains = new Map(initialDomains);
 
       while (true) {
-        const nextVar = selectMRVVariable(workingDomains);
+        const nextVar = selectMRVVariable(workingDomains, true);
         if (!nextVar) break;
-        const opts = workingDomains.get(nextVar.id) ?? [];
-        if (opts.length === 0) {
+
+        const validOpts = (workingDomains.get(nextVar.id) ?? []).filter(
+          (opt) => !violatesDailyCap(opt)
+        );
+
+        if (validOpts.length === 0) {
           unscheduled.push({
             variableId: nextVar.id,
             candidateId: nextVar.candidateId,
@@ -419,10 +543,28 @@ export class TimoraCSPSolver {
           });
           const idx = activeVariables.findIndex((v) => v.id === nextVar.id);
           if (idx >= 0) activeVariables.splice(idx, 1);
+
+          // Cascade unschedule any dependent rounds for this candidate
+          for (let j = activeVariables.length - 1; j >= 0; j--) {
+            const dep = activeVariables[j];
+            if (
+              dep.candidateId === nextVar.candidateId &&
+              (dep.prerequisiteRoundId === nextVar.roundId || dep.roundOrder > nextVar.roundOrder)
+            ) {
+              unscheduled.push({
+                variableId: dep.id,
+                candidateId: dep.candidateId,
+                roundId: dep.roundId,
+                reasonCode: 'UNMET_ROUND_PREREQUISITE',
+                explanation: `Prerequisite round ${nextVar.roundId} could not be scheduled.`,
+              });
+              activeVariables.splice(j, 1);
+            }
+          }
           continue;
         }
 
-        const chosen = opts[0];
+        const chosen = validOpts[0];
         currentAssignment.set(nextVar.id, chosen);
 
         for (const otherVar of activeVariables) {
@@ -490,4 +632,3 @@ export class TimoraCSPSolver {
     };
   }
 }
-
